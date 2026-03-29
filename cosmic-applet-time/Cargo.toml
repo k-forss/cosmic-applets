@@ -6,11 +6,13 @@ license = "GPL-3.0-only"
 
 [dependencies]
 cosmic-applets-config.workspace = true
+cosmic-config.workspace = true
 jiff = "0.2"
 i18n-embed-fl.workspace = true
 i18n-embed.workspace = true
 libcosmic.workspace = true
 rust-embed.workspace = true
+serde.workspace = true
 tokio.workspace = true
 tracing-log.workspace = true
 tracing-subscriber.workspace = true
@@ -19,3 +21,11 @@ icu = { version = "2.1.1", features = ["compiled_data"] }
 zbus.workspace = true
 timedate-zbus = { git = "https://github.com/pop-os/dbus-settings-bindings" }
 logind-zbus = "5.3.2"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots"] }
+ical = "0.11"
+uuid = { version = "1", features = ["v4"] }
+openidconnect = "3"
+secret-service = { version = "5", features = ["rt-tokio-crypto-rust"] }
+quick-xml = "0.37"
+url = "2"
+serde_json = "1"
