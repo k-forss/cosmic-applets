@@ -1010,14 +1010,16 @@ impl cosmic::Application for Window {
 
         let (show_seconds_tx, _) = watch::channel(true);
 
-        let (calendar_config_tx, _) = watch::channel(CalendarConfig::default());
-
         // Read config early to know which encryption mode we're in.
         let config_handle = cosmic_config::Config::new(CALENDAR_CONFIG_ID, 1).ok();
         let calendar_config = config_handle
             .as_ref()
             .and_then(|c| CalendarConfig::get_entry(c).ok())
             .unwrap_or_default();
+
+        // Seed the watch channel with the real config so the sync
+        // subscription has sources on its first borrow.
+        let (calendar_config_tx, _) = watch::channel(calendar_config.clone());
 
         // Determine whether we can load the cache immediately.
         // None mode: load plaintext cache now.
@@ -1297,11 +1299,17 @@ impl cosmic::Application for Window {
                 let mut config_rx = sub.config_rx.clone();
                 let encryption_key = sub.encryption_key.clone();
                 stream::channel(8, move |mut output: mpsc::Sender<Message>| async move {
-                    use std::collections::HashMap;
+                    use std::collections::{HashMap, HashSet};
                     use crate::calendar::config::SourceType;
 
+                    let period = time::Duration::from_secs(15 * 60);
                     let mut interval =
-                        time::interval(time::Duration::from_secs(15 * 60));
+                        time::interval_at(time::Instant::now() + period, period);
+
+                    // Last known good events/todos — used to carry forward
+                    // events from unchanged calendars during incremental sync.
+                    let mut last_events: Vec<CalendarEvent> = Vec::new();
+                    let mut last_todos: Vec<CalendarTodo> = Vec::new();
 
                     // Ctag cache owned by this subscription — ephemeral sync
                     // metadata that never touches the config file.
@@ -1352,14 +1360,16 @@ impl cosmic::Application for Window {
                         if !config.sources.is_empty() {
                             let (result, updated_sources) = calendar::sync_all(&config, true).await;
                             store_ctags(&updated_sources, &mut ctag_cache);
+                            last_events = result.events.clone();
+                            last_todos = result.todos.clone();
                             let _ = output.send(Message::CalendarSync(result.events, result.todos)).await;
                             if !result.auth_expired.is_empty() {
                                 let _ = output.send(Message::CalendarAuthExpired(result.auth_expired)).await;
                             }
                         }
                     }
-                    // Consume the first immediate tick so the loop starts clean.
-                    interval.tick().await;
+                    // interval_at already skips the immediate first
+                    // tick, so no need to consume one manually.
 
                     loop {
                         tokio::select! {
@@ -1372,7 +1382,34 @@ impl cosmic::Application for Window {
                                 store_ctags(&updated_sources, &mut ctag_cache);
                                 crate::calendar::cache::save_ctag_cache_dispatch(&ctag_cache, encryption_key.as_ref());
 
-                                let _ = output.send(Message::CalendarSync(result.events, result.todos)).await;
+                                // Incremental sync: merge new results with
+                                // events from sources that were not fetched
+                                // (e.g. ctag unchanged → calendar skipped).
+                                let fetched_source_ids: HashSet<&str> = result.events
+                                    .iter()
+                                    .map(|e| e.source_id.as_str())
+                                    .collect();
+                                let mut merged_events: Vec<CalendarEvent> = last_events
+                                    .iter()
+                                    .filter(|e| !fetched_source_ids.contains(e.source_id.as_str()))
+                                    .cloned()
+                                    .collect();
+                                merged_events.extend(result.events);
+
+                                let fetched_todo_sources: HashSet<&str> = result.todos
+                                    .iter()
+                                    .map(|t| t.source_id.as_str())
+                                    .collect();
+                                let mut merged_todos: Vec<CalendarTodo> = last_todos
+                                    .iter()
+                                    .filter(|t| !fetched_todo_sources.contains(t.source_id.as_str()))
+                                    .cloned()
+                                    .collect();
+                                merged_todos.extend(result.todos);
+
+                                last_events = merged_events.clone();
+                                last_todos = merged_todos.clone();
+                                let _ = output.send(Message::CalendarSync(merged_events, merged_todos)).await;
                                 if !result.auth_expired.is_empty() {
                                     let _ = output.send(Message::CalendarAuthExpired(result.auth_expired)).await;
                                 }
@@ -1380,8 +1417,10 @@ impl cosmic::Application for Window {
                             Ok(()) = config_rx.changed() => {
                                 let mut config = config_rx.borrow_and_update().clone();
                                 let minutes = config.sync_interval_minutes.max(1);
-                                interval = time::interval(
-                                    time::Duration::from_secs(u64::from(minutes) * 60),
+                                let new_period = time::Duration::from_secs(u64::from(minutes) * 60);
+                                interval = time::interval_at(
+                                    time::Instant::now() + new_period,
+                                    new_period,
                                 );
                                 if config.sources.is_empty() { continue; }
 
@@ -1391,6 +1430,8 @@ impl cosmic::Application for Window {
                                 store_ctags(&updated_sources, &mut ctag_cache);
                                 crate::calendar::cache::save_ctag_cache_dispatch(&ctag_cache, encryption_key.as_ref());
 
+                                last_events = result.events.clone();
+                                last_todos = result.todos.clone();
                                 let _ = output.send(Message::CalendarSync(result.events, result.todos)).await;
                                 if !result.auth_expired.is_empty() {
                                     let _ = output.send(Message::CalendarAuthExpired(result.auth_expired)).await;
