@@ -7,7 +7,7 @@ use cosmic::{
     cctk::sctk::reexports::calloop,
     cosmic_theme::Spacing,
     iced::{
-        Alignment, Length, Rectangle, Subscription,
+        Alignment, Length, Limits, Rectangle, Subscription,
         futures::{SinkExt, StreamExt, channel::mpsc},
         platform_specific::shell::wayland::commands::popup::{destroy_popup, get_popup},
         widget::{column, row, rule},
@@ -18,7 +18,7 @@ use cosmic::{
     surface, theme,
     widget::{
         Button, Grid, Id, autosize, button, container, divider, grid, icon, rectangle_tracker::*,
-        space, text,
+        scrollable, space, text,
     },
 };
 use jiff::{
@@ -35,12 +35,13 @@ use tokio::{sync::watch, time};
 
 use crate::calendar::{
     self, CalendarConfig, CalendarEvent, CalendarTodo, CALENDAR_CONFIG_ID,
-    config::SourceType,
+    config::{EncryptionMode, SourceType},
 };
 use crate::{config::TimeAppletConfig, fl, time::get_calendar_first};
 use cosmic::applet::token::subscription::{
     TokenRequest, TokenUpdate, activation_token_subscription,
 };
+use cosmic_config::CosmicConfigEntry;
 use std::collections::BTreeMap;
 use icu::{
     datetime::{
@@ -123,6 +124,22 @@ pub struct Window {
     deleting_event: bool,
     // VTODO state
     calendar_todos: Vec<CalendarTodo>,
+    // TODO creation state
+    creating_todo_saving: bool,
+    new_todo_summary: String,
+    new_todo_due_date: String,
+    new_todo_due_time: String,
+    new_todo_description: String,
+    new_todo_calendar_idx: usize,
+    /// false = creating event, true = creating todo
+    create_form_is_todo: bool,
+    /// UID of the todo currently being toggled (for optimistic update)
+    toggling_todo_uid: Option<String>,
+    // Encryption state
+    encryption_key: Option<calendar::crypto::EncryptionKey>,
+    passphrase_prompt_visible: bool,
+    passphrase_input: String,
+    keyring_locked: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -182,6 +199,23 @@ pub enum Message {
     CalendarToggleTodo(String),
     CalendarTodoToggled,
     CalendarTodoError(String),
+    // TODO creation messages
+    CalendarToggleCreateType,
+    CalFormTodoSummary(String),
+    CalFormTodoDueDate(String),
+    CalFormTodoDueTime(String),
+    CalFormTodoDescription(String),
+    CalFormTodoCalendar(usize),
+    CalendarSubmitCreateTodo,
+    CalendarTodoCreated,
+    CalendarTodoCreateError(String),
+    // Encryption / keyring messages
+    PassphraseInput(String),
+    PassphraseSubmitted,
+    PassphraseDismissed,
+    KeyringUnlocked,
+    KeyringStillLocked,
+    EncryptionKeyLoaded(Option<calendar::crypto::EncryptionKey>),
 }
 
 impl Window {
@@ -271,6 +305,32 @@ impl Window {
         .into()
     }
 
+    /// Event row that also shows the date (for upcoming events list).
+    fn event_row_with_date<'a>(&'a self, ev: &'a CalendarEvent) -> Element<'a, Message> {
+        let date = ev.date();
+        let datetime = self.create_datetime(&date);
+        let prefs = DateTimeFormatterPreferences::from(self.locale.clone());
+        let date_str = DateTimeFormatter::try_new(prefs, fieldsets::MD::short())
+            .unwrap()
+            .format(&datetime)
+            .to_string();
+        let time_str = ev.time_display();
+        let date_time = text::caption(format!("{date_str}  {time_str}"));
+        let summary_text = text::body(&ev.summary);
+        let color = parse_hex_color(&ev.color);
+        let indicator = container(space::horizontal().width(8).height(8))
+            .class(dot_color_class(color))
+            .padding([0, 4]);
+
+        menu_button(
+            row![indicator, column![date_time, summary_text].spacing(2)]
+                .align_y(Alignment::Center)
+                .spacing(8),
+        )
+        .on_press(Message::CalendarViewEvent(ev.uid.clone()))
+        .into()
+    }
+
     /// Collect writable CalDAV calendars: (source_id, calendar_href, display_label).
     fn writable_calendars(&self) -> Vec<(String, String, String)> {
         let mut result = Vec::new();
@@ -325,26 +385,73 @@ impl Window {
 
         // Calendar selector
         if !writable.is_empty() {
-            let mut cal_row = row![
-                text::caption(fl!("calendar-event-calendar")).apply(container).padding([6, 0]),
-            ]
-            .spacing(4);
+            form = form.push(
+                text::caption(fl!("calendar-event-calendar"))
+                    .apply(container)
+                    .padding([6, 0]),
+            );
 
-            for (i, (_, _, label)) in writable.iter().enumerate() {
+            let mut cal_list = column![].spacing(2);
+            for (i, (source_id, href, label)) in writable.iter().enumerate() {
+                let cal_color = self.calendar_config.sources.iter()
+                    .find(|s| s.id == *source_id)
+                    .and_then(|s| match &s.source_type {
+                        SourceType::CalDav { calendars, .. } =>
+                            calendars.iter().find(|c| c.href == *href),
+                        _ => None,
+                    })
+                    .map(|c| c.color.as_str())
+                    .unwrap_or("#0078D4");
+
+                let color = parse_hex_color(cal_color);
                 let class = if i == self.new_event_calendar_idx {
                     button::ButtonClass::Suggested
                 } else {
-                    button::ButtonClass::Standard
+                    button::ButtonClass::Text
                 };
-                cal_row = cal_row.push(
-                    button::custom(text::caption(label.clone()))
-                        .on_press(Message::CalFormEventCalendar(i))
-                        .class(class)
-                        .padding([4, 8]),
+                cal_list = cal_list.push(
+                    button::custom(
+                        row![
+                            container(space::horizontal().width(8).height(8))
+                                .class(dot_color_class(color))
+                                .padding([0, 4]),
+                            text::body(label.clone()),
+                        ]
+                        .spacing(6)
+                        .align_y(Alignment::Center),
+                    )
+                    .on_press(Message::CalFormEventCalendar(i))
+                    .class(class)
+                    .padding([4, 8])
+                    .width(Length::Fill),
                 );
             }
-            form = form.push(cal_row);
+
+            let selector: Element<'_, Message> = if writable.len() > 5 {
+                scrollable(cal_list).height(Length::Fixed(150.0)).into()
+            } else {
+                cal_list.into()
+            };
+            form = form.push(selector);
         }
+
+        // Description
+        form = form.push(
+            cosmic::widget::text_input(
+                fl!("calendar-event-description"),
+                &self.new_event_description,
+            )
+            .on_input(Message::CalFormEventDescription),
+        );
+
+        // Location
+        form = form.push(
+            cosmic::widget::text_input(
+                fl!("calendar-event-location"),
+                &self.new_event_location,
+            )
+            .on_input(Message::CalFormEventLocation),
+        );
 
         // Save / Cancel
         let save_label = if self.creating_event_saving {
@@ -358,6 +465,114 @@ impl Window {
         if !self.creating_event_saving && !self.new_event_summary.is_empty() && !writable.is_empty()
         {
             save_btn = save_btn.on_press(Message::CalendarSubmitCreateEvent);
+        }
+        form = form.push(
+            row![
+                save_btn,
+                button::custom(text::body(fl!("calendar-cancel")))
+                    .on_press(Message::CalendarCancelCreateEvent)
+                    .class(button::ButtonClass::Standard)
+                    .padding([4, 12]),
+            ]
+            .spacing(8),
+        );
+
+        let _ = (space_xxs, space_s);
+        form.into()
+    }
+
+    /// Render the TODO creation form.
+    fn create_todo_form(&self, space_xxs: u16, space_s: u16) -> Element<'_, Message> {
+        let writable = self.writable_calendars();
+        let mut form = column![].spacing(6).padding([8, 20]);
+
+        // Summary
+        form = form.push(
+            cosmic::widget::text_input(fl!("calendar-todo-summary"), &self.new_todo_summary)
+                .on_input(Message::CalFormTodoSummary),
+        );
+
+        // Due date
+        form = form.push(
+            cosmic::widget::text_input(fl!("calendar-todo-due-date"), &self.new_todo_due_date)
+                .on_input(Message::CalFormTodoDueDate),
+        );
+
+        // Due time (optional)
+        form = form.push(
+            cosmic::widget::text_input(fl!("calendar-todo-due-time"), &self.new_todo_due_time)
+                .on_input(Message::CalFormTodoDueTime),
+        );
+
+        // Calendar selector (same scrollable list as events)
+        if !writable.is_empty() {
+            form = form.push(
+                text::caption(fl!("calendar-event-calendar"))
+                    .apply(container)
+                    .padding([6, 0]),
+            );
+
+            let mut cal_list = column![].spacing(2);
+            for (i, (source_id, href, label)) in writable.iter().enumerate() {
+                let cal_color = self.calendar_config.sources.iter()
+                    .find(|s| s.id == *source_id)
+                    .and_then(|s| match &s.source_type {
+                        SourceType::CalDav { calendars, .. } =>
+                            calendars.iter().find(|c| c.href == *href),
+                        _ => None,
+                    })
+                    .map(|c| c.color.as_str())
+                    .unwrap_or("#0078D4");
+
+                let color = parse_hex_color(cal_color);
+                let class = if i == self.new_todo_calendar_idx {
+                    button::ButtonClass::Suggested
+                } else {
+                    button::ButtonClass::Text
+                };
+                cal_list = cal_list.push(
+                    button::custom(
+                        row![
+                            container(space::horizontal().width(8).height(8))
+                                .class(dot_color_class(color))
+                                .padding([0, 4]),
+                            text::body(label.clone()),
+                        ]
+                        .spacing(6)
+                        .align_y(Alignment::Center),
+                    )
+                    .on_press(Message::CalFormTodoCalendar(i))
+                    .class(class)
+                    .padding([4, 8])
+                    .width(Length::Fill),
+                );
+            }
+
+            let selector: Element<'_, Message> = if writable.len() > 5 {
+                scrollable(cal_list).height(Length::Fixed(150.0)).into()
+            } else {
+                cal_list.into()
+            };
+            form = form.push(selector);
+        }
+
+        // Description
+        form = form.push(
+            cosmic::widget::text_input(fl!("calendar-event-description"), &self.new_todo_description)
+                .on_input(Message::CalFormTodoDescription),
+        );
+
+        // Save / Cancel
+        let save_label = if self.creating_todo_saving {
+            fl!("calendar-todo-creating")
+        } else {
+            fl!("calendar-save")
+        };
+        let mut save_btn = button::custom(text::body(save_label))
+            .class(button::ButtonClass::Suggested)
+            .padding([4, 12]);
+        if !self.creating_todo_saving && !self.new_todo_summary.is_empty() && !writable.is_empty() {
+            save_btn = save_btn.on_press(Message::CalendarSubmitCreateTodo);
         }
         form = form.push(
             row![
@@ -433,6 +648,7 @@ impl Window {
                 .core
                 .applet
                 .popup_container(container(content))
+                .limits(Limits::NONE.min_width(1.).max_width(800.).min_height(1.).max_height(800.))
                 .into();
         }
 
@@ -521,6 +737,7 @@ impl Window {
                 .core
                 .applet
                 .popup_container(container(content))
+                .limits(Limits::NONE.min_width(1.).max_width(800.).min_height(1.).max_height(800.))
                 .into();
         }
 
@@ -594,6 +811,7 @@ impl Window {
         self.core
             .applet
             .popup_container(container(content))
+            .limits(Limits::NONE.min_width(1.).max_width(800.).min_height(1.).max_height(800.))
             .into()
     }
 
@@ -641,17 +859,6 @@ impl Window {
         }
 
         col.into()
-    }
-
-    fn save_calendar_config(&self) {
-        use cosmic_config::CosmicConfigEntry;
-        if let Ok(config) = cosmic_config::Config::new(CALENDAR_CONFIG_ID, 1) {
-            if let Err(e) = self.calendar_config.write_entry(&config) {
-                tracing::error!("Failed to save calendar config: {e}");
-            }
-        }
-        self.calendar_config_tx
-            .send_replace(self.calendar_config.clone());
     }
 
     /// Format with strftime if non-empty and ignore errors.
@@ -805,15 +1012,66 @@ impl cosmic::Application for Window {
 
         let (calendar_config_tx, _) = watch::channel(CalendarConfig::default());
 
-        // Load cached events for fast startup
-        let (cached_events, cached_todos) = calendar::cache::load_cache()
+        // Read config early to know which encryption mode we're in.
+        let config_handle = cosmic_config::Config::new(CALENDAR_CONFIG_ID, 1).ok();
+        let calendar_config = config_handle
+            .as_ref()
+            .and_then(|c| CalendarConfig::get_entry(c).ok())
             .unwrap_or_default();
+
+        // Determine whether we can load the cache immediately.
+        // None mode: load plaintext cache now.
+        // Auto/Manual: cache load is deferred until the encryption key is ready.
+        let needs_key = !matches!(calendar_config.encryption_mode, EncryptionMode::None);
+        let (cached_events, cached_todos) = if needs_key {
+            (Vec::new(), Vec::new())
+        } else {
+            calendar::cache::load_cache().unwrap_or_default()
+        };
+
         let calendar_events = calendar::events_by_date(&cached_events);
         let upcoming_events = calendar::upcoming_events(
             &cached_events,
             today,
-            5, // default upcoming_count before config loads
+            calendar_config.upcoming_count,
         );
+
+        // For Auto mode, fire off an async task to load/generate the key.
+        // For Manual mode, we show a passphrase prompt instead.
+        let passphrase_prompt_visible = matches!(calendar_config.encryption_mode, EncryptionMode::Manual);
+
+        let startup_task = match calendar_config.encryption_mode {
+            EncryptionMode::None => Task::none(),
+            EncryptionMode::Auto => {
+                cosmic::task::future(async {
+                    match calendar::secrets::load_encryption_key().await {
+                        Ok(Some(bytes)) if bytes.len() == 32 => {
+                            let mut arr = [0u8; 32];
+                            arr.copy_from_slice(&bytes);
+                            Message::EncryptionKeyLoaded(Some(
+                                calendar::crypto::EncryptionKey::from_bytes(arr),
+                            ))
+                        }
+                        Ok(_) => {
+                            // No key yet — generate one and store it
+                            let key = calendar::crypto::generate_key();
+                            if let Err(e) = calendar::secrets::store_encryption_key(key.as_bytes()).await {
+                                tracing::warn!("Failed to store auto encryption key: {e}");
+                            }
+                            Message::EncryptionKeyLoaded(Some(key))
+                        }
+                        Err(e) => {
+                            tracing::warn!("Failed to load encryption key (keyring locked?): {e}");
+                            Message::KeyringStillLocked
+                        }
+                    }
+                })
+            }
+            EncryptionMode::Manual => {
+                // Key will be derived when user submits passphrase
+                Task::none()
+            }
+        };
 
         (
             Self {
@@ -832,7 +1090,7 @@ impl cosmic::Application for Window {
                 calendar_events,
                 all_events: cached_events,
                 upcoming_events,
-                calendar_config: CalendarConfig::default(),
+                calendar_config: calendar_config.clone(),
                 calendar_config_tx,
                 calendar_syncing: false,
                 calendar_error: None,
@@ -852,8 +1110,20 @@ impl cosmic::Application for Window {
                 confirming_delete: false,
                 deleting_event: false,
                 calendar_todos: cached_todos,
+                creating_todo_saving: false,
+                new_todo_summary: String::new(),
+                new_todo_due_date: String::new(),
+                new_todo_due_time: String::new(),
+                new_todo_description: String::new(),
+                new_todo_calendar_idx: 0,
+                create_form_is_todo: false,
+                toggling_todo_uid: None,
+                encryption_key: None,
+                passphrase_prompt_visible,
+                passphrase_input: String::new(),
+                keyring_locked: false,
             },
-            Task::none(),
+            startup_task,
         )
     }
 
@@ -1009,9 +1279,11 @@ impl cosmic::Application for Window {
 
         fn calendar_sync_subscription(
             config_rx: watch::Receiver<CalendarConfig>,
+            encryption_key: Option<calendar::crypto::EncryptionKey>,
         ) -> Subscription<Message> {
             struct SyncSub {
                 config_rx: watch::Receiver<CalendarConfig>,
+                encryption_key: Option<calendar::crypto::EncryptionKey>,
                 id: &'static str,
             }
             impl Hash for SyncSub {
@@ -1020,49 +1292,140 @@ impl cosmic::Application for Window {
                 }
             }
             Subscription::run_with(
-                SyncSub { config_rx, id: "calendar-sync" },
+                SyncSub { config_rx, encryption_key, id: "calendar-sync" },
                 |sub| {
                 let mut config_rx = sub.config_rx.clone();
+                let encryption_key = sub.encryption_key.clone();
                 stream::channel(8, move |mut output: mpsc::Sender<Message>| async move {
-                    config_rx.mark_changed();
+                    use std::collections::HashMap;
+                    use crate::calendar::config::SourceType;
 
                     let mut interval =
                         time::interval(time::Duration::from_secs(15 * 60));
 
-                    loop {
-                        tokio::select! {
-                            _ = interval.tick() => {
-                                let config = config_rx.borrow().clone();
-                                if config.sources.is_empty() { continue; }
+                    // Ctag cache owned by this subscription — ephemeral sync
+                    // metadata that never touches the config file.
+                    // Key: (source_id, calendar_href) → (ctag, sync_token)
+                    let mut ctag_cache: HashMap<(String, String), (Option<String>, Option<String>)> = HashMap::new();
 
-                                {
-                                    let (result, updated_sources) = calendar::sync_all(&config).await;
-                                    let _ = output.send(Message::CalendarSync(result.events, result.todos)).await;
-                                    if !result.auth_expired.is_empty() {
-                                        let _ = output.send(Message::CalendarAuthExpired(result.auth_expired)).await;
-                                    }
-                                    if updated_sources != config.sources {
-                                        let _ = output.send(Message::CalendarCtagUpdate(updated_sources)).await;
+                    /// Inject cached ctags into a config before syncing.
+                    fn inject_ctags(
+                        config: &mut CalendarConfig,
+                        cache: &HashMap<(String, String), (Option<String>, Option<String>)>,
+                    ) {
+                        for src in &mut config.sources {
+                            if let SourceType::CalDav { calendars, .. } = &mut src.source_type {
+                                for cal in calendars.iter_mut() {
+                                    if let Some((ctag, sync_token)) =
+                                        cache.get(&(src.id.clone(), cal.href.clone()))
+                                    {
+                                        cal.ctag.clone_from(ctag);
+                                        cal.sync_token.clone_from(sync_token);
                                     }
                                 }
                             }
+                        }
+                    }
+
+                    /// Store updated ctags back into the cache after sync.
+                    fn store_ctags(
+                        sources: &[crate::calendar::config::SourceConfig],
+                        cache: &mut HashMap<(String, String), (Option<String>, Option<String>)>,
+                    ) {
+                        for src in sources {
+                            if let SourceType::CalDav { calendars, .. } = &src.source_type {
+                                for cal in calendars {
+                                    if cal.ctag.is_some() || cal.sync_token.is_some() {
+                                        cache.insert(
+                                            (src.id.clone(), cal.href.clone()),
+                                            (cal.ctag.clone(), cal.sync_token.clone()),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Initial full sync — no ctag/sync-token shortcuts.
+                    {
+                        let config = config_rx.borrow_and_update().clone();
+                        if !config.sources.is_empty() {
+                            let (result, updated_sources) = calendar::sync_all(&config, true).await;
+                            store_ctags(&updated_sources, &mut ctag_cache);
+                            let _ = output.send(Message::CalendarSync(result.events, result.todos)).await;
+                            if !result.auth_expired.is_empty() {
+                                let _ = output.send(Message::CalendarAuthExpired(result.auth_expired)).await;
+                            }
+                        }
+                    }
+                    // Consume the first immediate tick so the loop starts clean.
+                    interval.tick().await;
+
+                    loop {
+                        tokio::select! {
+                            _ = interval.tick() => {
+                                let mut config = config_rx.borrow().clone();
+                                if config.sources.is_empty() { continue; }
+
+                                inject_ctags(&mut config, &ctag_cache);
+                                let (result, updated_sources) = calendar::sync_all(&config, false).await;
+                                store_ctags(&updated_sources, &mut ctag_cache);
+                                crate::calendar::cache::save_ctag_cache_dispatch(&ctag_cache, encryption_key.as_ref());
+
+                                let _ = output.send(Message::CalendarSync(result.events, result.todos)).await;
+                                if !result.auth_expired.is_empty() {
+                                    let _ = output.send(Message::CalendarAuthExpired(result.auth_expired)).await;
+                                }
+                            }
                             Ok(()) = config_rx.changed() => {
-                                let config = config_rx.borrow_and_update().clone();
+                                let mut config = config_rx.borrow_and_update().clone();
                                 let minutes = config.sync_interval_minutes.max(1);
                                 interval = time::interval(
                                     time::Duration::from_secs(u64::from(minutes) * 60),
                                 );
                                 if config.sources.is_empty() { continue; }
-                                {
-                                    let (result, updated_sources) = calendar::sync_all(&config).await;
-                                    let _ = output.send(Message::CalendarSync(result.events, result.todos)).await;
-                                    if !result.auth_expired.is_empty() {
-                                        let _ = output.send(Message::CalendarAuthExpired(result.auth_expired)).await;
-                                    }
-                                    if updated_sources != config.sources {
-                                        let _ = output.send(Message::CalendarCtagUpdate(updated_sources)).await;
-                                    }
+
+                                // Manual sync and config changes always do
+                                // a full fetch.
+                                let (result, updated_sources) = calendar::sync_all(&config, true).await;
+                                store_ctags(&updated_sources, &mut ctag_cache);
+                                crate::calendar::cache::save_ctag_cache_dispatch(&ctag_cache, encryption_key.as_ref());
+
+                                let _ = output.send(Message::CalendarSync(result.events, result.todos)).await;
+                                if !result.auth_expired.is_empty() {
+                                    let _ = output.send(Message::CalendarAuthExpired(result.auth_expired)).await;
                                 }
+                            }
+                        }
+                    }
+                })
+            })
+        }
+
+        fn keyring_poll_subscription(active: bool) -> Subscription<Message> {
+            if !active {
+                return Subscription::none();
+            }
+            #[derive(Hash)]
+            struct KeyringPoll;
+            Subscription::run_with(KeyringPoll, |_| {
+                stream::channel(1, |mut output: mpsc::Sender<Message>| async move {
+                    loop {
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                        match calendar::secrets::load_encryption_key().await {
+                            Ok(Some(bytes)) if bytes.len() == 32 => {
+                                let _ = output.send(Message::KeyringUnlocked).await;
+                                // Stop polling once unlocked
+                                std::future::pending::<()>().await;
+                            }
+                            Ok(_) => {
+                                // Key not stored yet — treat as unlocked so
+                                // the Auto handler can generate one.
+                                let _ = output.send(Message::KeyringUnlocked).await;
+                                std::future::pending::<()>().await;
+                            }
+                            Err(_) => {
+                                let _ = output.send(Message::KeyringStillLocked).await;
                             }
                         }
                     }
@@ -1072,13 +1435,15 @@ impl cosmic::Application for Window {
 
         let show_seconds_rx = self.show_seconds_tx.subscribe();
         let calendar_config_rx = self.calendar_config_tx.subscribe();
+        let keyring_locked = self.keyring_locked;
         Subscription::batch([
             rectangle_tracker_subscription(0).map(|e| Message::Rectangle(e.1)),
             time_subscription(show_seconds_rx),
             activation_token_subscription(0).map(Message::Token),
             timezone_subscription(),
             wake_from_sleep_subscription(),
-            calendar_sync_subscription(calendar_config_rx),
+            calendar_sync_subscription(calendar_config_rx, self.encryption_key.clone()),
+            keyring_poll_subscription(keyring_locked),
             self.core.watch_config(Self::APP_ID).map(|u| {
                 for err in u.errors {
                     tracing::error!(?err, "Error watching config");
@@ -1100,7 +1465,7 @@ impl cosmic::Application for Window {
         match message {
             Message::TogglePopup => {
                 if let Some(p) = self.popup.take() {
-                    destroy_popup(p)
+                    return destroy_popup(p);
                 } else {
                     self.date_today = self.now.date();
                     self.date_selected = self.date_today;
@@ -1129,8 +1494,13 @@ impl cosmic::Application for Window {
                     };
 
                     popup_settings.positioner.size = None;
+                    popup_settings.positioner.size_limits = Limits::NONE
+                        .min_width(1.)
+                        .max_width(800.)
+                        .min_height(1.)
+                        .max_height(800.);
 
-                    get_popup(popup_settings)
+                    return get_popup(popup_settings);
                 }
             }
             Message::Tick => {
@@ -1262,7 +1632,7 @@ impl cosmic::Application for Window {
                     self.date_today,
                     self.calendar_config.upcoming_count,
                 );
-                calendar::cache::save_cache(&events, &todos);
+                calendar::cache::save_cache_dispatch(&events, &todos, self.encryption_key.as_ref());
                 self.all_events = events;
                 self.calendar_todos = todos;
                 self.calendar_syncing = false;
@@ -1284,37 +1654,30 @@ impl cosmic::Application for Window {
                 Task::none()
             }
             Message::CalendarConfigChanged(config) => {
+                // Settings app is the sole writer of the config file.
+                // The applet is a read-only consumer — just accept whatever
+                // the file watcher delivers and forward to the sync
+                // subscription.  Ctag/sync_token are managed entirely
+                // inside the sync subscription's closure.
                 self.calendar_config = config.clone();
                 self.calendar_config_tx.send_replace(config);
                 Task::none()
             }
-            Message::CalendarToggleSource(id) => {
-                if let Some(src) = self.calendar_config.sources.iter_mut().find(|s| s.id == id) {
-                    src.enabled = !src.enabled;
-                }
-                self.save_calendar_config();
+            Message::CalendarToggleSource(_) | Message::CalendarRemoveSource(_) => {
+                // These are managed by the settings app — the applet is
+                // a read-only consumer of the config file.
                 Task::none()
             }
-            Message::CalendarRemoveSource(id) => {
-                self.calendar_config.sources.retain(|s| s.id != id);
-                self.save_calendar_config();
-                let source_id = id;
-                tokio::spawn(async move {
-                    if let Err(e) = calendar::secrets::delete_secrets(&source_id).await {
-                        tracing::warn!("Failed to clean up keyring secrets: {e}");
-                    }
-                });
-                Task::none()
-            }
-            Message::CalendarCtagUpdate(updated_sources) => {
-                self.calendar_config.sources = updated_sources;
-                self.save_calendar_config();
+            Message::CalendarCtagUpdate(_) => {
+                // Ctag updates are now handled entirely inside the sync
+                // subscription — this message is no longer sent.
                 Task::none()
             }
             // ── Event creation handlers ────────────────────────────
             Message::CalendarStartCreateEvent => {
                 self.creating_event = true;
                 self.creating_event_saving = false;
+                self.create_form_is_todo = false;
                 self.new_event_summary.clear();
                 self.new_event_start_time = String::from("09:00");
                 self.new_event_end_time = String::from("10:00");
@@ -1322,11 +1685,19 @@ impl cosmic::Application for Window {
                 self.new_event_calendar_idx = 0;
                 self.new_event_description.clear();
                 self.new_event_location.clear();
+                // Reset todo fields
+                self.new_todo_summary.clear();
+                self.new_todo_due_date.clear();
+                self.new_todo_due_time.clear();
+                self.new_todo_description.clear();
+                self.new_todo_calendar_idx = 0;
                 Task::none()
             }
             Message::CalendarCancelCreateEvent => {
                 self.creating_event = false;
                 self.creating_event_saving = false;
+                self.creating_todo_saving = false;
+                self.create_form_is_todo = false;
                 Task::none()
             }
             Message::CalendarSubmitCreateEvent => {
@@ -1359,53 +1730,73 @@ impl cosmic::Application for Window {
 
                 self.creating_event_saving = true;
 
+                let uid = uuid::Uuid::new_v4().to_string();
+
+                let (dtstart, dtend) = if all_day {
+                    let start = date
+                        .at(0, 0, 0, 0)
+                        .to_zoned(jiff::tz::TimeZone::UTC)
+                        .unwrap();
+                    let end = date
+                        .checked_add(jiff::ToSpan::days(1))
+                        .unwrap_or(date)
+                        .at(0, 0, 0, 0)
+                        .to_zoned(jiff::tz::TimeZone::UTC)
+                        .unwrap();
+                    (start, Some(end))
+                } else {
+                    let (sh, sm) = parse_hhmm(&start_time).unwrap_or((9, 0));
+                    let (eh, em) = parse_hhmm(&end_time).unwrap_or((10, 0));
+                    let start = date
+                        .at(sh, sm, 0, 0)
+                        .to_zoned(jiff::tz::TimeZone::system())
+                        .unwrap();
+                    let end = date
+                        .at(eh, em, 0, 0)
+                        .to_zoned(jiff::tz::TimeZone::system())
+                        .unwrap();
+                    (start, Some(end))
+                };
+
+                let description = if self.new_event_description.is_empty() {
+                    None
+                } else {
+                    Some(self.new_event_description.clone())
+                };
+                let location = if self.new_event_location.is_empty() {
+                    None
+                } else {
+                    Some(self.new_event_location.clone())
+                };
+
+                let event = CalendarEvent {
+                    uid,
+                    source_id: source_id.clone(),
+                    summary,
+                    description,
+                    location,
+                    dtstart,
+                    dtend,
+                    all_day,
+                    url: None,
+                    color: String::new(),
+                    etag: None,
+                    href: None,
+                    rrule: None,
+                    exdates: Vec::new(),
+                    rdates: Vec::new(),
+                };
+
+                // Optimistic local update: add to all_events + rebuild derived state
+                self.all_events.push(event.clone());
+                self.calendar_events = calendar::events_by_date(&self.all_events);
+                self.upcoming_events = calendar::upcoming_events(
+                    &self.all_events,
+                    self.date_today,
+                    self.calendar_config.upcoming_count,
+                );
+
                 return cosmic::task::future(async move {
-                    let uid = uuid::Uuid::new_v4().to_string();
-
-                    let (dtstart, dtend) = if all_day {
-                        let start = date
-                            .at(0, 0, 0, 0)
-                            .to_zoned(jiff::tz::TimeZone::UTC)
-                            .unwrap();
-                        let end = date
-                            .checked_add(jiff::ToSpan::days(1))
-                            .unwrap_or(date)
-                            .at(0, 0, 0, 0)
-                            .to_zoned(jiff::tz::TimeZone::UTC)
-                            .unwrap();
-                        (start, Some(end))
-                    } else {
-                        let (sh, sm) = parse_hhmm(&start_time).unwrap_or((9, 0));
-                        let (eh, em) = parse_hhmm(&end_time).unwrap_or((10, 0));
-                        let start = date
-                            .at(sh, sm, 0, 0)
-                            .to_zoned(jiff::tz::TimeZone::system())
-                            .unwrap();
-                        let end = date
-                            .at(eh, em, 0, 0)
-                            .to_zoned(jiff::tz::TimeZone::system())
-                            .unwrap();
-                        (start, Some(end))
-                    };
-
-                    let event = CalendarEvent {
-                        uid,
-                        source_id: source_id.clone(),
-                        summary,
-                        description: None,
-                        location: None,
-                        dtstart,
-                        dtend,
-                        all_day,
-                        url: None,
-                        color: String::new(),
-                        etag: None,
-                        href: None,
-                        rrule: None,
-                        exdates: Vec::new(),
-                        rdates: Vec::new(),
-                    };
-
                     match calendar::caldav::create_event(
                         &calendar_href,
                         &event,
@@ -1423,7 +1814,14 @@ impl cosmic::Application for Window {
             Message::CalendarEventCreated => {
                 self.creating_event = false;
                 self.creating_event_saving = false;
-                // Trigger a sync to pick up the new event from the server
+                // Rebuild derived state (optimistic — event was added at submit time or will arrive on sync)
+                self.calendar_events = calendar::events_by_date(&self.all_events);
+                self.upcoming_events = calendar::upcoming_events(
+                    &self.all_events,
+                    self.date_today,
+                    self.calendar_config.upcoming_count,
+                );
+                // Still trigger a sync to reconcile with server
                 self.calendar_syncing = true;
                 self.calendar_config_tx
                     .send_replace(self.calendar_config.clone());
@@ -1465,6 +1863,10 @@ impl cosmic::Application for Window {
             }
             // ── Event detail view handlers ─────────────────────────
             Message::CalendarViewEvent(uid) => {
+                // Select the event's date in the grid
+                if let Some(ev) = self.all_events.iter().find(|e| e.uid == uid) {
+                    self.date_selected = ev.date();
+                }
                 self.viewing_event_uid = Some(uid);
                 self.editing_event = false;
                 self.confirming_delete = false;
@@ -1479,13 +1881,40 @@ impl cosmic::Application for Window {
                 Task::none()
             }
             Message::CalendarLaunchExternalApp => {
-                let calendar_app = if self.calendar_config.calendar_app.is_empty() {
-                    "gnome-calendar".to_string()
+                if !self.calendar_config.calendar_app.is_empty() {
+                    // Legacy: explicit app name in config
+                    let app = &self.calendar_config.calendar_app;
+                    if let Err(e) = std::process::Command::new(app).spawn() {
+                        tracing::error!("Failed to open calendar app '{app}': {e}");
+                    }
                 } else {
-                    self.calendar_config.calendar_app.clone()
-                };
-                if let Err(e) = std::process::Command::new(&calendar_app).spawn() {
-                    tracing::error!("Failed to open calendar app '{calendar_app}': {e}");
+                    // Use XDG default for text/calendar MIME type
+                    match std::process::Command::new("xdg-mime")
+                        .args(["query", "default", "text/calendar"])
+                        .output()
+                    {
+                        Ok(output) => {
+                            let desktop_id =
+                                String::from_utf8_lossy(&output.stdout).trim().to_string();
+                            if desktop_id.is_empty() {
+                                tracing::warn!("No default calendar app configured");
+                            } else {
+                                let name = desktop_id
+                                    .strip_suffix(".desktop")
+                                    .unwrap_or(&desktop_id);
+                                if let Err(e) =
+                                    std::process::Command::new("gtk-launch").arg(name).spawn()
+                                {
+                                    tracing::error!(
+                                        "Failed to launch default calendar app '{desktop_id}': {e}"
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!("Failed to query default calendar app: {e}");
+                        }
+                    }
                 }
                 Task::none()
             }
@@ -1609,6 +2038,29 @@ impl cosmic::Application for Window {
                 });
             }
             Message::CalendarEventUpdated => {
+                // Optimistic update: apply edit form values to local event
+                if let Some(uid) = &self.viewing_event_uid {
+                    if let Some(event) = self.all_events.iter_mut().find(|e| e.uid == *uid) {
+                        event.summary = self.new_event_summary.clone();
+                        event.description = if self.new_event_description.is_empty() {
+                            None
+                        } else {
+                            Some(self.new_event_description.clone())
+                        };
+                        event.location = if self.new_event_location.is_empty() {
+                            None
+                        } else {
+                            Some(self.new_event_location.clone())
+                        };
+                        event.all_day = self.new_event_all_day;
+                    }
+                    self.calendar_events = calendar::events_by_date(&self.all_events);
+                    self.upcoming_events = calendar::upcoming_events(
+                        &self.all_events,
+                        self.date_today,
+                        self.calendar_config.upcoming_count,
+                    );
+                }
                 self.editing_event = false;
                 self.editing_event_saving = false;
                 self.viewing_event_uid = None;
@@ -1665,6 +2117,16 @@ impl cosmic::Application for Window {
                 });
             }
             Message::CalendarEventDeleted => {
+                // Optimistic removal
+                if let Some(uid) = &self.viewing_event_uid {
+                    self.all_events.retain(|e| e.uid != *uid);
+                    self.calendar_events = calendar::events_by_date(&self.all_events);
+                    self.upcoming_events = calendar::upcoming_events(
+                        &self.all_events,
+                        self.date_today,
+                        self.calendar_config.upcoming_count,
+                    );
+                }
                 self.viewing_event_uid = None;
                 self.confirming_delete = false;
                 self.deleting_event = false;
@@ -1682,6 +2144,7 @@ impl cosmic::Application for Window {
             }
             // ── VTODO handlers ─────────────────────────────────────
             Message::CalendarToggleTodo(uid) => {
+                self.toggling_todo_uid = Some(uid.clone());
                 let Some(todo) = self.calendar_todos.iter().find(|t| t.uid == uid).cloned()
                 else {
                     return Task::none();
@@ -1713,6 +2176,12 @@ impl cosmic::Application for Window {
                 });
             }
             Message::CalendarTodoToggled => {
+                // Optimistic toggle
+                if let Some(uid) = self.toggling_todo_uid.take() {
+                    if let Some(todo) = self.calendar_todos.iter_mut().find(|t| t.uid == uid) {
+                        todo.completed = !todo.completed;
+                    }
+                }
                 self.calendar_syncing = true;
                 self.calendar_config_tx
                     .send_replace(self.calendar_config.clone());
@@ -1721,6 +2190,226 @@ impl cosmic::Application for Window {
             Message::CalendarTodoError(err) => {
                 tracing::error!("Failed to toggle todo: {err}");
                 self.calendar_error = Some(err);
+                Task::none()
+            }
+            // ── TODO creation handlers ─────────────────────────────
+            Message::CalendarToggleCreateType => {
+                self.create_form_is_todo = !self.create_form_is_todo;
+                Task::none()
+            }
+            Message::CalFormTodoSummary(v) => {
+                self.new_todo_summary = v;
+                Task::none()
+            }
+            Message::CalFormTodoDueDate(v) => {
+                self.new_todo_due_date = v;
+                Task::none()
+            }
+            Message::CalFormTodoDueTime(v) => {
+                self.new_todo_due_time = v;
+                Task::none()
+            }
+            Message::CalFormTodoDescription(v) => {
+                self.new_todo_description = v;
+                Task::none()
+            }
+            Message::CalFormTodoCalendar(i) => {
+                self.new_todo_calendar_idx = i;
+                Task::none()
+            }
+            Message::CalendarSubmitCreateTodo => {
+                let writable = self.writable_calendars();
+                if self.new_todo_summary.is_empty() || writable.is_empty() {
+                    return Task::none();
+                }
+                self.creating_todo_saving = true;
+                let (source_id, cal_href, _) = writable
+                    .get(self.new_todo_calendar_idx)
+                    .cloned()
+                    .unwrap_or_else(|| writable[0].clone());
+
+                let uid = uuid::Uuid::new_v4().to_string();
+                let due = parse_todo_due(&self.new_todo_due_date, &self.new_todo_due_time);
+                let todo = CalendarTodo {
+                    uid,
+                    source_id: source_id.clone(),
+                    summary: self.new_todo_summary.clone(),
+                    description: if self.new_todo_description.is_empty() {
+                        None
+                    } else {
+                        Some(self.new_todo_description.clone())
+                    },
+                    due,
+                    completed: false,
+                    priority: None,
+                    color: String::new(),
+                    etag: None,
+                    href: None,
+                };
+
+                let source = self.calendar_config.sources.iter()
+                    .find(|s| s.id == source_id).cloned();
+                let Some(source) = source else { return Task::none(); };
+                let auth = match &source.source_type {
+                    SourceType::CalDav { auth, .. } => auth.clone(),
+                    _ => return Task::none(),
+                };
+                let ca_cert = source.ca_cert_path.clone();
+
+                return cosmic::task::future(async move {
+                    match calendar::caldav::create_todo(
+                        &cal_href, &todo, &auth, &source_id, ca_cert.as_deref(),
+                    ).await {
+                        Ok(()) => Message::CalendarTodoCreated,
+                        Err(e) => Message::CalendarTodoCreateError(e.to_string()),
+                    }
+                });
+            }
+            Message::CalendarTodoCreated => {
+                self.creating_event = false;
+                self.creating_todo_saving = false;
+                self.create_form_is_todo = false;
+                self.new_todo_summary.clear();
+                self.new_todo_due_date.clear();
+                self.new_todo_due_time.clear();
+                self.new_todo_description.clear();
+                self.new_todo_calendar_idx = 0;
+                // Trigger re-sync
+                self.calendar_syncing = true;
+                self.calendar_config_tx.send_replace(self.calendar_config.clone());
+                Task::none()
+            }
+            Message::CalendarTodoCreateError(err) => {
+                tracing::error!("Failed to create todo: {err}");
+                self.creating_todo_saving = false;
+                self.calendar_error = Some(err);
+                Task::none()
+            }
+            // ── Encryption / keyring handlers ─────────────────────
+            Message::PassphraseInput(v) => {
+                self.passphrase_input = v;
+                Task::none()
+            }
+            Message::PassphraseSubmitted => {
+                if self.passphrase_input.is_empty() {
+                    return Task::none();
+                }
+                // Derive key from passphrase.  Salt is loaded from/stored to
+                // a sidecar file next to the cache.
+                let salt_path = calendar::cache::salt_path();
+                let salt = if let Some(ref p) = salt_path {
+                    match std::fs::read(p) {
+                        Ok(bytes) if bytes.len() == 16 => {
+                            let mut arr = [0u8; 16];
+                            arr.copy_from_slice(&bytes);
+                            arr
+                        }
+                        _ => {
+                            let new_salt = calendar::crypto::generate_salt();
+                            if let Some(parent) = p.parent() {
+                                let _ = std::fs::create_dir_all(parent);
+                            }
+                            let _ = std::fs::write(p, new_salt);
+                            new_salt
+                        }
+                    }
+                } else {
+                    calendar::crypto::generate_salt()
+                };
+
+                let key = calendar::crypto::derive_key_from_passphrase(
+                    &self.passphrase_input,
+                    &salt,
+                );
+                // Zeroize passphrase immediately
+                use zeroize::Zeroize;
+                self.passphrase_input.zeroize();
+
+                self.encryption_key = Some(key.clone());
+                self.passphrase_prompt_visible = false;
+
+                // Load encrypted cache now that we have the key
+                let (events, todos) = calendar::cache::load_cache_dispatch(Some(&key))
+                    .unwrap_or_default();
+                self.all_events = events;
+                self.calendar_todos = todos;
+                self.calendar_events = calendar::events_by_date(&self.all_events);
+                self.upcoming_events = calendar::upcoming_events(
+                    &self.all_events,
+                    self.date_today,
+                    self.calendar_config.upcoming_count,
+                );
+
+                // Trigger sync
+                self.calendar_syncing = true;
+                self.calendar_config_tx.send_replace(self.calendar_config.clone());
+                Task::none()
+            }
+            Message::PassphraseDismissed => {
+                // User dismissed passphrase prompt — continue without encryption
+                self.passphrase_prompt_visible = false;
+                self.passphrase_input.clear();
+                // Load plaintext cache as fallback
+                let (events, todos) = calendar::cache::load_cache().unwrap_or_default();
+                self.all_events = events;
+                self.calendar_todos = todos;
+                self.calendar_events = calendar::events_by_date(&self.all_events);
+                self.upcoming_events = calendar::upcoming_events(
+                    &self.all_events,
+                    self.date_today,
+                    self.calendar_config.upcoming_count,
+                );
+                self.calendar_syncing = true;
+                self.calendar_config_tx.send_replace(self.calendar_config.clone());
+                Task::none()
+            }
+            Message::KeyringUnlocked => {
+                self.keyring_locked = false;
+                // Retry loading the encryption key
+                cosmic::task::future(async {
+                    match calendar::secrets::load_encryption_key().await {
+                        Ok(Some(bytes)) if bytes.len() == 32 => {
+                            let mut arr = [0u8; 32];
+                            arr.copy_from_slice(&bytes);
+                            Message::EncryptionKeyLoaded(Some(
+                                calendar::crypto::EncryptionKey::from_bytes(arr),
+                            ))
+                        }
+                        Ok(_) => {
+                            let key = calendar::crypto::generate_key();
+                            if let Err(e) = calendar::secrets::store_encryption_key(key.as_bytes()).await {
+                                tracing::warn!("Failed to store auto encryption key: {e}");
+                            }
+                            Message::EncryptionKeyLoaded(Some(key))
+                        }
+                        Err(e) => {
+                            tracing::warn!("Keyring still not accessible: {e}");
+                            Message::KeyringStillLocked
+                        }
+                    }
+                })
+            }
+            Message::KeyringStillLocked => {
+                self.keyring_locked = true;
+                Task::none()
+            }
+            Message::EncryptionKeyLoaded(key) => {
+                self.keyring_locked = false;
+                self.encryption_key = key.clone();
+                // Load encrypted cache now
+                let (events, todos) = calendar::cache::load_cache_dispatch(key.as_ref())
+                    .unwrap_or_default();
+                self.all_events = events;
+                self.calendar_todos = todos;
+                self.calendar_events = calendar::events_by_date(&self.all_events);
+                self.upcoming_events = calendar::upcoming_events(
+                    &self.all_events,
+                    self.date_today,
+                    self.calendar_config.upcoming_count,
+                );
+                // Trigger sync now that cache is loaded
+                self.calendar_syncing = true;
+                self.calendar_config_tx.send_replace(self.calendar_config.clone());
                 Task::none()
             }
         }
@@ -1761,7 +2450,65 @@ impl cosmic::Application for Window {
             space_xxs, space_s, ..
         } = theme::active().cosmic().spacing;
 
-        // Event detail view
+        // Keyring locked banner
+        if self.keyring_locked {
+            let content = column![
+                row![
+                    icon::from_name("dialog-password-symbolic").size(24),
+                    text::body(fl!("calendar-keyring-locked")),
+                ]
+                .spacing(12)
+                .align_y(Alignment::Center)
+                .apply(container)
+                .padding([20, 20]),
+            ];
+            return self
+                .core
+                .applet
+                .popup_container(container(content))
+                .limits(Limits::NONE.min_width(1.).max_width(400.).min_height(1.).max_height(100.))
+                .into();
+        }
+
+        // Manual-mode passphrase prompt
+        if self.passphrase_prompt_visible {
+            let mut submit_btn = button::custom(text::body(fl!("calendar-passphrase-unlock")))
+                .class(button::ButtonClass::Suggested)
+                .padding([4, 12]);
+            if !self.passphrase_input.is_empty() {
+                submit_btn = submit_btn.on_press(Message::PassphraseSubmitted);
+            }
+            let content = column![
+                text::body(fl!("calendar-passphrase-prompt"))
+                    .apply(container)
+                    .padding([12, 20]),
+                cosmic::widget::text_input(fl!("calendar-passphrase-placeholder"), &self.passphrase_input)
+                    .on_input(Message::PassphraseInput)
+                    .on_submit(|_| Message::PassphraseSubmitted)
+                    .password()
+                    .apply(container)
+                    .padding([0, 20]),
+                row![
+                    submit_btn,
+                    button::custom(text::body(fl!("calendar-cancel")))
+                        .on_press(Message::PassphraseDismissed)
+                        .class(button::ButtonClass::Standard)
+                        .padding([4, 12]),
+                ]
+                .spacing(8)
+                .apply(container)
+                .padding([8, 20]),
+            ]
+            .spacing(8);
+            return self
+                .core
+                .applet
+                .popup_container(container(content))
+                .limits(Limits::NONE.min_width(1.).max_width(400.).min_height(1.).max_height(200.))
+                .into();
+        }
+
+        // Event detail view (full-width overlay)
         if let Some(ref uid) = self.viewing_event_uid {
             if let Some(event) = self.all_events.iter().find(|e| e.uid == *uid) {
                 return self.event_detail_view(event, space_xxs, space_s);
@@ -1803,32 +2550,30 @@ impl cosmic::Application for Window {
                     .on_press(Message::GoToToday),
             );
         }
-        if !self.writable_calendars().is_empty() {
-            header_buttons = header_buttons.push(
-                button::icon(icon::from_name("list-add-symbolic"))
-                    .padding(8)
-                    .on_press(Message::CalendarStartCreateEvent),
-            );
-        }
         header_buttons = header_buttons.push(month_controls);
 
         let calendar = self.calendar_grid();
 
-        let mut content_list = column![
-            row![
-                column![date, day_of_week],
-                space::horizontal().width(Length::Fill),
-                header_buttons,
-            ]
-            .align_y(Alignment::Center)
-            .padding([12, 20]),
-            calendar.padding([0, 12].into()),
+        // Header row: date on the left, buttons on the right
+        let header_row = row![
+            column![date, day_of_week],
+            space::horizontal(),
+            header_buttons,
         ]
-        .padding([8, 0]);
+        .align_y(Alignment::Center)
+        .padding([12, 20]);
+
+        // ── Center column: header + grid (fixed) ──
+        let center_fixed = column![
+            header_row,
+            calendar.padding([0, 12].into()),
+        ];
+
+        let mut center_scroll = column![];
 
         // Sync status indicator
         if self.calendar_syncing {
-            content_list = content_list.push(
+            center_scroll = center_scroll.push(
                 row![
                     icon::from_name("emblem-synchronizing-symbolic").size(16),
                     text::body(fl!("calendar-syncing")),
@@ -1842,7 +2587,7 @@ impl cosmic::Application for Window {
 
         // Error banner
         if let Some(ref err) = self.calendar_error {
-            content_list = content_list.push(
+            center_scroll = center_scroll.push(
                 row![
                     icon::from_name("dialog-warning-symbolic").size(16),
                     text::body(format!("{}: {}", fl!("calendar-sync-error"), err)),
@@ -1860,7 +2605,7 @@ impl cosmic::Application for Window {
                 self.calendar_config.sources.iter().find(|s| s.id == *sid).map(|s| s.name.as_str())
             }).collect();
             if !source_names.is_empty() {
-                content_list = content_list.push(
+                center_scroll = center_scroll.push(
                     row![
                         icon::from_name("dialog-password-symbolic").size(16),
                         text::body(format!("{}: {}", fl!("calendar-source-oidc-reauth"), source_names.join(", "))),
@@ -1873,63 +2618,122 @@ impl cosmic::Application for Window {
             }
         }
 
-        // Events for the selected day
-        let day_events = self.calendar_events.get(&self.date_selected);
-        if let Some(events) = day_events {
-            if !events.is_empty() {
-                content_list = content_list
-                    .push(padded_control(divider::horizontal::default()).padding([space_xxs, space_s]));
-                content_list = content_list.push(
-                    text::body(fl!("calendar-events-today"))
-                        .apply(container)
-                        .padding([0, 20]),
-                );
-                for ev in events {
-                    content_list = content_list.push(self.event_row(ev));
-                }
-            }
-        }
+        // Events for the selected day — shown in right column below
 
-        // Add Event form
+        // Create event/todo form
         if self.creating_event {
-            content_list = content_list
+            center_scroll = center_scroll
                 .push(padded_control(divider::horizontal::default()).padding([space_xxs, space_s]));
-            content_list = content_list.push(self.create_event_form(space_xxs, space_s));
-        }
 
-        // Upcoming events
-        if !self.upcoming_events.is_empty() {
-            content_list = content_list
-                .push(padded_control(divider::horizontal::default()).padding([space_xxs, space_s]));
-            content_list = content_list.push(
-                text::body(fl!("calendar-upcoming"))
-                    .apply(container)
-                    .padding([0, 20]),
+            // Event / Task toggle
+            let event_class = if !self.create_form_is_todo {
+                button::ButtonClass::Suggested
+            } else {
+                button::ButtonClass::Standard
+            };
+            let todo_class = if self.create_form_is_todo {
+                button::ButtonClass::Suggested
+            } else {
+                button::ButtonClass::Standard
+            };
+            center_scroll = center_scroll.push(
+                row![
+                    button::custom(text::body(fl!("calendar-create-type-event")))
+                        .class(event_class)
+                        .on_press(Message::CalendarToggleCreateType)
+                        .padding([4, 12]),
+                    button::custom(text::body(fl!("calendar-create-type-todo")))
+                        .class(todo_class)
+                        .on_press(Message::CalendarToggleCreateType)
+                        .padding([4, 12]),
+                ]
+                .spacing(8)
+                .apply(container)
+                .padding([0, 20]),
             );
-            for ev in &self.upcoming_events {
-                content_list = content_list.push(self.event_row(ev));
+
+            if self.create_form_is_todo {
+                center_scroll = center_scroll.push(self.create_todo_form(space_xxs, space_s));
+            } else {
+                center_scroll = center_scroll.push(self.create_event_form(space_xxs, space_s));
             }
         }
 
-        // Todos section
-        if !self.calendar_todos.is_empty() {
-            content_list = content_list.push(
-                padded_control(divider::horizontal::default()).padding([space_xxs, space_s]),
-            );
-            content_list = content_list.push(self.todo_section());
+        // ── Left column: upcoming events ──
+        let mut left_col_content = column![].spacing(4);
+        left_col_content = left_col_content.push(
+            text::body(fl!("calendar-upcoming"))
+                .apply(container)
+                .padding([0, 8]),
+        );
+        for ev in &self.upcoming_events {
+            left_col_content = left_col_content.push(self.event_row_with_date(ev));
+        }
+        let left_col = scrollable(left_col_content).width(Length::Fixed(220.));
+
+        // ── Right column: selected day events + todos ──
+        let mut right_col_content = column![].spacing(4);
+
+        // Events for the selected day
+        right_col_content = right_col_content.push(
+            text::body(fl!("calendar-selected-day-events"))
+                .apply(container)
+                .padding([0, 8]),
+        );
+        if let Some(events) = self.calendar_events.get(&self.date_selected) {
+            for ev in events {
+                right_col_content = right_col_content.push(self.event_row(ev));
+            }
         }
 
-        content_list = content_list
-            .push(padded_control(divider::horizontal::default()).padding([space_xxs, space_s]));
+        right_col_content = right_col_content.push(self.todo_section());
+        let right_col = scrollable(right_col_content).width(Length::Fixed(220.));
 
-        content_list = content_list.push(
+        // ── Assemble: center column ──
+        // Bottom bar: [sync] [+] ——— [Settings…]
+        let sync_button = button::icon(icon::from_name("emblem-synchronizing-symbolic"))
+            .padding(8);
+        let sync_button = if self.calendar_syncing {
+            sync_button
+        } else {
+            sync_button.on_press(Message::CalendarRefresh)
+        };
+        let mut bottom_bar = row![sync_button].spacing(8).align_y(Alignment::Center);
+        if !self.writable_calendars().is_empty() {
+            bottom_bar = bottom_bar.push(
+                button::icon(icon::from_name("list-add-symbolic"))
+                    .padding(8)
+                    .on_press(Message::CalendarStartCreateEvent),
+            );
+        }
+        bottom_bar = bottom_bar.push(space::horizontal());
+        bottom_bar = bottom_bar.push(
             menu_button(text::body(fl!("datetime-settings")))
                 .on_press(Message::OpenDateTimeSettings),
         );
+        center_scroll = center_scroll
+            .push(padded_control(divider::horizontal::default()).padding([space_xxs, space_s]));
+        center_scroll = center_scroll.push(
+            bottom_bar.apply(container).padding([0, 8]),
+        );
+        let center_col = column![center_fixed, scrollable(center_scroll)]
+            .width(Length::Fixed(360.));
+
+        // ── Main row: left | center | right ──
+        let main_row = row![left_col, center_col, right_col]
+            .spacing(0)
+            .padding([8, 0]);
+
+        let popup_limits = Limits::NONE
+            .min_width(1.)
+            .max_width(800.)
+            .min_height(1.)
+            .max_height(800.);
 
         self.core
             .applet
-            .popup_container(container(content_list))
+            .popup_container(container(main_row))
+            .limits(popup_limits)
             .into()
     }
 
@@ -1938,7 +2742,7 @@ impl cosmic::Application for Window {
     }
 }
 
-fn date_button(date: Date, is_month: bool, is_day: bool, is_today: bool, has_events: bool) -> Button<'static, Message> {
+fn date_button(date: Date, is_month: bool, is_day: bool, is_today: bool, has_events: bool) -> Element<'static, Message> {
     let day = date.day();
     let style = if is_day {
         button::ButtonClass::Suggested
@@ -1948,37 +2752,54 @@ fn date_button(date: Date, is_month: bool, is_day: bool, is_today: bool, has_eve
         button::ButtonClass::Text
     };
 
+    let dim_class = if !is_month {
+        Some(cosmic::theme::Text::Custom(|theme| {
+            let c = theme.cosmic().on_bg_color();
+            cosmic::iced_widget::text::Style {
+                color: Some(cosmic::iced::Color { r: c.red, g: c.green, b: c.blue, a: c.alpha * 0.5 }),
+            }
+        }))
+    } else {
+        None
+    };
+
     let content: Element<'static, Message> = if has_events {
+        let mut day_text = text::body(format!("{day}"));
+        let mut dot_text = text::caption("●");
+        if let Some(c) = dim_class {
+            day_text = day_text.class(c);
+            dot_text = dot_text.class(c);
+        }
         column![
-            text::body(format!("{day}"))
+            day_text
                 .apply(container)
                 .center_x(Length::Fill),
-            text::caption("●")
+            dot_text
                 .apply(container)
                 .center_x(Length::Fill),
         ]
         .align_x(Alignment::Center)
         .into()
     } else {
-        text::body(format!("{day}"))
+        let mut day_text = text::body(format!("{day}"));
+        if let Some(c) = dim_class {
+            day_text = day_text.class(c);
+        }
+        day_text
             .apply(container)
             .center(Length::Fill)
             .into()
     };
 
-    let btn = button::custom(content)
+    button::custom(content)
         .class(style)
         .height(Length::Fixed(44.0))
-        .width(Length::Fixed(44.0));
-
-    if is_month || is_day || is_today {
-        btn.on_press(Message::SelectDate(date))
-    } else {
-        btn
-    }
+        .width(Length::Fixed(44.0))
+        .on_press(Message::SelectDate(date))
+        .into()
 }
 
-fn parse_hex_color(hex: &str) -> cosmic::iced::Color {
+pub(crate) fn parse_hex_color(hex: &str) -> cosmic::iced::Color {
     let hex = hex.trim_start_matches('#');
     if hex.len() >= 6 {
         let r = u8::from_str_radix(&hex[0..2], 16).unwrap_or(128);
@@ -2008,7 +2829,7 @@ fn dot_color_class(color: cosmic::iced::Color) -> cosmic::theme::Container<'stat
 }
 
 /// Parse a "HH:MM" string into (hour, minute).
-fn parse_hhmm(s: &str) -> Option<(i8, i8)> {
+pub(crate) fn parse_hhmm(s: &str) -> Option<(i8, i8)> {
     let mut parts = s.split(':');
     let h: i8 = parts.next()?.trim().parse().ok()?;
     let m: i8 = parts.next()?.trim().parse().ok()?;
@@ -2017,4 +2838,26 @@ fn parse_hhmm(s: &str) -> Option<(i8, i8)> {
     } else {
         None
     }
+}
+
+/// Parse "YYYY-MM-DD" and optional "HH:MM" into a Zoned datetime.
+pub(crate) fn parse_todo_due(date_str: &str, time_str: &str) -> Option<Zoned> {
+    if date_str.is_empty() {
+        return None;
+    }
+    let parts: Vec<&str> = date_str.split('-').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let y: i16 = parts[0].parse().ok()?;
+    let mo: i8 = parts[1].parse().ok()?;
+    let d: i8 = parts[2].parse().ok()?;
+    let date = Date::new(y, mo, d).ok()?;
+    let (h, m) = if time_str.is_empty() {
+        (0, 0)
+    } else {
+        let (hh, mm) = parse_hhmm(time_str)?;
+        (hh, mm)
+    };
+    Some(date.at(h, m, 0, 0).to_zoned(TimeZone::system()).ok()?)
 }

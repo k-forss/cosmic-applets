@@ -5,7 +5,7 @@ edition = "2024"
 license = "GPL-3.0-only"
 
 [dependencies]
-cosmic-applets-config.workspace = true
+cosmic-applets-config = { workspace = true, features = ["calendar-auth", "calendar-discovery", "calendar-crypto"] }
 cosmic-config.workspace = true
 jiff = "0.2"
 i18n-embed-fl.workspace = true
@@ -29,3 +29,10 @@ secret-service = { version = "5", features = ["rt-tokio-crypto-rust"] }
 quick-xml = "0.37"
 url = "2"
 serde_json = "1"
+chacha20poly1305 = "0.10"
+zeroize = { version = "1", features = ["derive"] }
+argon2 = "0.5"
+rand = "0.8"
+
+[dev-dependencies]
+tempfile = "3"

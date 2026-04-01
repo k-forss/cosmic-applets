@@ -62,21 +62,21 @@ async fn apply_ics_auth(
                 .await
                 .map_err(|e| format!("Failed to load password from keyring: {e}"))?
                 .unwrap_or_default();
-            request.basic_auth(username, Some(password))
+            request.basic_auth(username, Some(password.as_str()))
         }
         AuthMethod::Bearer => {
             let token = secrets::load_secret(source_id, SecretKind::BearerToken)
                 .await
                 .map_err(|e| format!("Failed to load bearer token: {e}"))?
                 .ok_or_else(|| "Bearer token not found in keyring".to_string())?;
-            request.bearer_auth(token)
+            request.bearer_auth(token.as_str())
         }
         AuthMethod::Oidc { has_token: true, .. } => {
             let token = secrets::load_secret(source_id, SecretKind::OidcAccessToken)
                 .await
                 .map_err(|e| format!("Failed to load OIDC token: {e}"))?
                 .ok_or_else(|| "OIDC token not found".to_string())?;
-            request.bearer_auth(token)
+            request.bearer_auth(token.as_str())
         }
         AuthMethod::Oidc { has_token: false, .. } => {
             return Err("OIDC authentication required".to_string());

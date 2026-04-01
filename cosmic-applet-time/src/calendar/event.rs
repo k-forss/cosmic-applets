@@ -225,10 +225,11 @@ pub fn parse_ics_datetime(value: &str, tzid: Option<&str>) -> Option<Zoned> {
         let date = tm.to_date().ok()?;
         Some(date.at(0, 0, 0, 0).to_zoned(TimeZone::UTC).ok()?)
     } else if value.ends_with('Z') {
-        // UTC: YYYYMMDDTHHMMSSz
-        let tm = strtime::parse("%Y%m%dT%H%M%SZ", value).ok()?;
-        let ts = tm.to_timestamp().ok()?;
-        Some(ts.to_zoned(TimeZone::UTC))
+        // UTC: YYYYMMDDTHHMMSSZ — strip trailing Z and parse as datetime
+        let bare = &value[..value.len() - 1];
+        let tm = strtime::parse("%Y%m%dT%H%M%S", bare).ok()?;
+        let dt = tm.to_datetime().ok()?;
+        Some(dt.to_zoned(TimeZone::UTC).ok()?)
     } else if let Some(tzid) = tzid {
         // Localised with TZID parameter
         let tm = strtime::parse("%Y%m%dT%H%M%S", value).ok()?;
@@ -351,10 +352,12 @@ impl CalendarTodo {
     pub fn due_display(&self) -> String {
         if let Some(due) = &self.due {
             format!(
-                "{}{:02}{:02}",
+                "{}-{:02}-{:02} {:02}:{:02}",
                 due.date().year(),
                 due.date().month(),
-                due.date().day()
+                due.date().day(),
+                due.hour(),
+                due.minute(),
             )
         } else {
             String::new()

@@ -1,19 +1,46 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
+#[cfg(feature = "calendar-auth")]
+pub mod auth;
+#[cfg(feature = "calendar-discovery")]
+pub mod discovery;
+#[cfg(feature = "calendar-auth")]
+pub mod secrets;
+
 use cosmic_config::{CosmicConfigEntry, cosmic_config_derive::CosmicConfigEntry};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 pub const CALENDAR_CONFIG_ID: &str = "com.system76.CosmicAppletTime.Calendar";
+
+/// Controls how cache files (event_cache.json, ctag_cache.json) are encrypted
+/// on disk.  Credentials always live in the keyring regardless of this setting.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum EncryptionMode {
+    /// No encryption — plain JSON on disk.
+    None,
+    /// Transparent encryption with a random key stored in the keyring.
+    Auto,
+    /// User-supplied passphrase → Argon2id-derived key, held in RAM while applet runs.
+    Manual,
+}
+
+impl Default for EncryptionMode {
+    fn default() -> Self {
+        Self::Auto
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, CosmicConfigEntry, Deserialize, Serialize)]
 #[version = 1]
 pub struct CalendarConfig {
     pub sources: Vec<SourceConfig>,
-    pub sync_interval_minutes: u32,
+    pub sync_interval_minutes: u64,
     pub upcoming_count: usize,
     pub calendar_app: String,
     pub sync_range_past_days: u32,
     pub sync_range_future_days: u32,
+    #[serde(default)]
+    pub encryption_mode: EncryptionMode,
 }
 
 impl Default for CalendarConfig {
@@ -25,6 +52,7 @@ impl Default for CalendarConfig {
             calendar_app: String::new(),
             sync_range_past_days: 30,
             sync_range_future_days: 90,
+            encryption_mode: EncryptionMode::default(),
         }
     }
 }
@@ -80,15 +108,21 @@ pub struct CalDavCalendar {
     /// Human-readable name from the server (`displayname` property).
     pub display_name: String,
     /// Server-provided color (e.g. from `calendar-color` property).
-    pub color: Option<String>,
+    #[serde(default = "default_calendar_color", deserialize_with = "deserialize_color_compat")]
+    pub color: String,
     /// Whether the user has opted to sync this calendar.
     pub enabled: bool,
     /// Cached ctag from the server.  If unchanged across syncs the calendar
     /// does not need to be re-fetched.
-    #[serde(default)]
+    ///
+    /// Ephemeral sync state — intentionally NOT serialized to disk.
+    /// The sync subscription maintains its own ctag cache in memory.
+    #[serde(default, skip_serializing)]
     pub ctag: Option<String>,
     /// WebDAV sync-token for incremental sync (RFC 6578).
-    #[serde(default)]
+    ///
+    /// Ephemeral sync state — intentionally NOT serialized to disk.
+    #[serde(default, skip_serializing)]
     pub sync_token: Option<String>,
 }
 
@@ -124,5 +158,67 @@ impl Default for AuthMethod {
 }
 
 fn default_oidc_scopes() -> Vec<String> {
-    vec!["openid".to_string(), "offline_access".to_string()]
+    vec![
+        "openid".to_string(),
+        "profile".to_string(),
+        "email".to_string(),
+        "offline_access".to_string(),
+    ]
+}
+
+fn default_calendar_color() -> String {
+    "#0078D4".to_string()
+}
+
+/// Backward-compatible deserializer for the `color` field.
+/// Handles both the old `Option<String>` format (`None` / `Some("...")`)
+/// and the current plain `String` format.
+fn deserialize_color_compat<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct ColorVisitor;
+
+    impl<'de> serde::de::Visitor<'de> for ColorVisitor {
+        type Value = String;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("a color string or None")
+        }
+
+        fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<String, E> {
+            Ok(v.to_string())
+        }
+
+        fn visit_string<E: serde::de::Error>(self, v: String) -> Result<String, E> {
+            Ok(v)
+        }
+
+        fn visit_none<E: serde::de::Error>(self) -> Result<String, E> {
+            Ok(default_calendar_color())
+        }
+
+        fn visit_unit<E: serde::de::Error>(self) -> Result<String, E> {
+            Ok(default_calendar_color())
+        }
+
+        fn visit_some<D2: Deserializer<'de>>(self, d: D2) -> Result<String, D2::Error> {
+            String::deserialize(d)
+        }
+
+        fn visit_enum<A: serde::de::EnumAccess<'de>>(self, data: A) -> Result<String, A::Error> {
+            use serde::de::VariantAccess;
+            let (variant, access) = data.variant::<String>()?;
+            match variant.as_str() {
+                "None" => {
+                    access.unit_variant()?;
+                    Ok(default_calendar_color())
+                }
+                "Some" => access.newtype_variant::<String>(),
+                _ => Ok(variant),
+            }
+        }
+    }
+
+    deserializer.deserialize_any(ColorVisitor)
 }

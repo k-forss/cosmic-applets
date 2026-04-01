@@ -9,7 +9,8 @@
 use crate::calendar::event::{CalendarEvent, CalendarTodo};
 use jiff::{civil::Date, tz::TimeZone, Timestamp, Zoned};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Serialize, Deserialize)]
 struct EventCache {
@@ -170,39 +171,378 @@ fn cached_to_todo(c: CachedTodo) -> CalendarTodo {
     }
 }
 
-pub fn save_cache(events: &[CalendarEvent], todos: &[CalendarTodo]) {
-    let Some(path) = cache_path() else {
-        return;
-    };
+pub(crate) fn save_cache_to_path(path: &Path, events: &[CalendarEvent], todos: &[CalendarTodo]) -> Result<(), String> {
     let cache = EventCache {
         timestamp: Zoned::now().timestamp().to_string(),
         events: events.iter().map(event_to_cached).collect(),
         todos: todos.iter().map(todo_to_cached).collect(),
     };
-    let json = match serde_json::to_string(&cache) {
-        Ok(j) => j,
-        Err(e) => {
-            tracing::warn!("Failed to serialize event cache: {e}");
-            return;
-        }
-    };
+    let json = serde_json::to_string(&cache).map_err(|e| format!("serialize: {e}"))?;
     if let Some(parent) = path.parent() {
-        if let Err(e) = std::fs::create_dir_all(parent) {
-            tracing::warn!("Failed to create cache directory: {e}");
-            return;
-        }
+        std::fs::create_dir_all(parent).map_err(|e| format!("mkdir: {e}"))?;
     }
-    if let Err(e) = std::fs::write(&path, json) {
-        tracing::warn!("Failed to write event cache: {e}");
+    std::fs::write(path, json).map_err(|e| format!("write: {e}"))?;
+    Ok(())
+}
+
+pub(crate) fn load_cache_from_path(path: &Path) -> Option<(Vec<CalendarEvent>, Vec<CalendarTodo>)> {
+    let data = std::fs::read_to_string(path).ok()?;
+    let cache: EventCache = serde_json::from_str(&data).ok()?;
+    let events: Vec<CalendarEvent> = cache.events.into_iter().filter_map(cached_to_event).collect();
+    let todos: Vec<CalendarTodo> = cache.todos.into_iter().map(cached_to_todo).collect();
+    Some((events, todos))
+}
+
+pub fn save_cache(events: &[CalendarEvent], todos: &[CalendarTodo]) {
+    let Some(path) = cache_path() else {
+        return;
+    };
+    if let Err(e) = save_cache_to_path(&path, events, todos) {
+        tracing::warn!("Failed to save event cache: {e}");
     }
 }
 
 /// Returns `None` if the cache doesn't exist or is unreadable.
 pub fn load_cache() -> Option<(Vec<CalendarEvent>, Vec<CalendarTodo>)> {
     let path = cache_path()?;
-    let data = std::fs::read_to_string(&path).ok()?;
-    let cache: EventCache = serde_json::from_str(&data).ok()?;
-    let events: Vec<CalendarEvent> = cache.events.into_iter().filter_map(cached_to_event).collect();
-    let todos: Vec<CalendarTodo> = cache.todos.into_iter().map(cached_to_todo).collect();
+    load_cache_from_path(&path)
+}
+
+// ── Encrypted cache operations ────────────────────────────
+
+use crate::calendar::crypto::EncryptionKey;
+
+/// Save events+todos as encrypted bytes.
+pub fn save_cache_encrypted(
+    events: &[CalendarEvent],
+    todos: &[CalendarTodo],
+    key: &EncryptionKey,
+) {
+    let Some(path) = cache_path() else { return };
+    let cache = EventCache {
+        timestamp: jiff::Zoned::now().timestamp().to_string(),
+        events: events.iter().map(event_to_cached).collect(),
+        todos: todos.iter().map(todo_to_cached).collect(),
+    };
+    let json = match serde_json::to_string(&cache) {
+        Ok(j) => j,
+        Err(e) => {
+            tracing::warn!("Failed to serialize cache for encryption: {e}");
+            return;
+        }
+    };
+    let encrypted = crate::calendar::crypto::encrypt(json.as_bytes(), key);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Err(e) = std::fs::write(&path, encrypted) {
+        tracing::warn!("Failed to write encrypted cache: {e}");
+    }
+}
+
+/// Load events+todos from an encrypted cache file.
+///
+/// Returns `None` on any failure (missing, wrong key, corrupt).
+pub fn load_cache_encrypted(
+    key: &EncryptionKey,
+) -> Option<(Vec<CalendarEvent>, Vec<CalendarTodo>)> {
+    let path = cache_path()?;
+    let data = std::fs::read(&path).ok()?;
+    let plaintext = match crate::calendar::crypto::decrypt(&data, key) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!("Cache decryption failed, will resync: {e}");
+            // Invalid/wrong key — delete the stale file so next sync writes fresh
+            let _ = std::fs::remove_file(&path);
+            return None;
+        }
+    };
+    let cache: EventCache = serde_json::from_slice(&plaintext).ok()?;
+    let events = cache.events.into_iter().filter_map(cached_to_event).collect();
+    let todos = cache.todos.into_iter().map(cached_to_todo).collect();
     Some((events, todos))
+}
+
+/// Dispatch to encrypted or plaintext save based on whether a key is available.
+pub fn save_cache_dispatch(
+    events: &[CalendarEvent],
+    todos: &[CalendarTodo],
+    key: Option<&EncryptionKey>,
+) {
+    match key {
+        Some(k) => save_cache_encrypted(events, todos, k),
+        None => save_cache(events, todos),
+    }
+}
+
+/// Dispatch to encrypted or plaintext load based on whether a key is available.
+///
+/// If decryption fails the cache file is deleted so the next sync rebuilds it.
+pub fn load_cache_dispatch(
+    key: Option<&EncryptionKey>,
+) -> Option<(Vec<CalendarEvent>, Vec<CalendarTodo>)> {
+    match key {
+        Some(k) => load_cache_encrypted(k),
+        None => load_cache(),
+    }
+}
+
+/// Delete both cache files (event + ctag).  Used when switching encryption modes
+/// so the next sync rebuilds the cache in the new format.
+pub fn delete_cache_files() {
+    if let Some(path) = cache_path() {
+        let _ = std::fs::remove_file(&path);
+    }
+    if let Some(path) = ctag_cache_path() {
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+/// Encrypted ctag cache operations — same pattern as event cache.
+pub fn save_ctag_cache_encrypted(
+    cache: &HashMap<(String, String), (Option<String>, Option<String>)>,
+    key: &EncryptionKey,
+) {
+    let Some(path) = ctag_cache_path() else { return };
+    let entries: HashMap<String, (Option<String>, Option<String>)> = cache
+        .iter()
+        .map(|((sid, href), v)| (format!("{sid}::{href}"), v.clone()))
+        .collect();
+    let data = CtagCache { entries };
+    let json = match serde_json::to_string(&data) {
+        Ok(j) => j,
+        Err(e) => {
+            tracing::warn!("Failed to serialize ctag cache for encryption: {e}");
+            return;
+        }
+    };
+    let encrypted = crate::calendar::crypto::encrypt(json.as_bytes(), key);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Err(e) = std::fs::write(&path, encrypted) {
+        tracing::warn!("Failed to write encrypted ctag cache: {e}");
+    }
+}
+
+pub fn load_ctag_cache_encrypted(
+    key: &EncryptionKey,
+) -> HashMap<(String, String), (Option<String>, Option<String>)> {
+    let Some(path) = ctag_cache_path() else {
+        return HashMap::new();
+    };
+    let Ok(data) = std::fs::read(&path) else {
+        return HashMap::new();
+    };
+    let plaintext = match crate::calendar::crypto::decrypt(&data, key) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!("Ctag cache decryption failed: {e}");
+            let _ = std::fs::remove_file(&path);
+            return HashMap::new();
+        }
+    };
+    let Ok(cache) = serde_json::from_slice::<CtagCache>(&plaintext) else {
+        return HashMap::new();
+    };
+    cache
+        .entries
+        .into_iter()
+        .filter_map(|(key, val)| {
+            let (sid, href) = key.split_once("::")?;
+            Some(((sid.to_string(), href.to_string()), val))
+        })
+        .collect()
+}
+
+pub fn save_ctag_cache_dispatch(
+    cache: &HashMap<(String, String), (Option<String>, Option<String>)>,
+    key: Option<&EncryptionKey>,
+) {
+    match key {
+        Some(k) => save_ctag_cache_encrypted(cache, k),
+        None => save_ctag_cache(cache),
+    }
+}
+
+pub fn load_ctag_cache_dispatch(
+    key: Option<&EncryptionKey>,
+) -> HashMap<(String, String), (Option<String>, Option<String>)> {
+    match key {
+        Some(k) => load_ctag_cache_encrypted(k),
+        None => load_ctag_cache(),
+    }
+}
+
+// ── Ctag / Sync-Token cache ───────────────────────────────
+
+#[derive(Debug, Serialize, Deserialize, Default)]
+struct CtagCache {
+    /// Key: "source_id::calendar_href", Value: (ctag, sync_token)
+    entries: HashMap<String, (Option<String>, Option<String>)>,
+}
+
+fn ctag_cache_path() -> Option<PathBuf> {
+    let mut path = cache_path()?;
+    path.set_file_name("ctag_cache.json");
+    Some(path)
+}
+
+/// Path for the Manual-mode passphrase salt (not secret, stored alongside cache).
+pub fn salt_path() -> Option<PathBuf> {
+    let mut path = cache_path()?;
+    path.set_file_name("encryption_salt.bin");
+    Some(path)
+}
+
+pub fn save_ctag_cache(cache: &HashMap<(String, String), (Option<String>, Option<String>)>) {
+    let Some(path) = ctag_cache_path() else { return };
+    let entries: HashMap<String, (Option<String>, Option<String>)> = cache
+        .iter()
+        .map(|((sid, href), v)| (format!("{sid}::{href}"), v.clone()))
+        .collect();
+    let data = CtagCache { entries };
+    match serde_json::to_string(&data) {
+        Ok(json) => {
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if let Err(e) = std::fs::write(&path, json) {
+                tracing::warn!("Failed to write ctag cache: {e}");
+            }
+        }
+        Err(e) => tracing::warn!("Failed to serialize ctag cache: {e}"),
+    }
+}
+
+pub fn load_ctag_cache() -> HashMap<(String, String), (Option<String>, Option<String>)> {
+    let Some(path) = ctag_cache_path() else {
+        return HashMap::new();
+    };
+    let Ok(data) = std::fs::read_to_string(&path) else {
+        return HashMap::new();
+    };
+    let Ok(cache) = serde_json::from_str::<CtagCache>(&data) else {
+        return HashMap::new();
+    };
+    cache
+        .entries
+        .into_iter()
+        .filter_map(|(key, val)| {
+            let (sid, href) = key.split_once("::")?;
+            Some(((sid.to_string(), href.to_string()), val))
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::calendar::crypto::EncryptionKey;
+
+    fn test_event() -> CalendarEvent {
+        let now = jiff::Zoned::now();
+        CalendarEvent {
+            uid: "test-uid-1".into(),
+            source_id: "src-1".into(),
+            summary: "Team Meeting".into(),
+            description: Some("Weekly sync".into()),
+            location: Some("Room 42".into()),
+            dtstart: now.clone(),
+            dtend: Some(now.checked_add(jiff::Span::new().hours(1)).unwrap()),
+            all_day: false,
+            url: None,
+            color: "#ff0000".into(),
+            etag: Some("\"etag-abc\"".into()),
+            href: Some("/cal/event1.ics".into()),
+            rrule: None,
+            exdates: vec![],
+            rdates: vec![],
+        }
+    }
+
+    fn test_todo() -> CalendarTodo {
+        CalendarTodo {
+            uid: "todo-uid-1".into(),
+            source_id: "src-1".into(),
+            summary: "Fix bug".into(),
+            description: None,
+            due: Some(jiff::Zoned::now()),
+            completed: false,
+            priority: Some(1),
+            color: "#00ff00".into(),
+            etag: None,
+            href: None,
+        }
+    }
+
+    #[test]
+    fn cache_encrypted_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("event_cache.json");
+
+        let events = vec![test_event()];
+        let todos = vec![test_todo()];
+        let key = EncryptionKey::from_bytes([42u8; 32]);
+
+        // Serialize, encrypt, write
+        let cache = EventCache {
+            timestamp: jiff::Zoned::now().timestamp().to_string(),
+            events: events.iter().map(event_to_cached).collect(),
+            todos: todos.iter().map(todo_to_cached).collect(),
+        };
+        let json = serde_json::to_string(&cache).unwrap();
+        let encrypted = crate::calendar::crypto::encrypt(json.as_bytes(), &key);
+        std::fs::write(&path, &encrypted).unwrap();
+
+        // Read, decrypt, deserialize
+        let data = std::fs::read(&path).unwrap();
+        let plaintext = crate::calendar::crypto::decrypt(&data, &key).unwrap();
+        let loaded: EventCache = serde_json::from_slice(&plaintext).unwrap();
+
+        assert_eq!(loaded.events.len(), 1);
+        assert_eq!(loaded.events[0].summary, "Team Meeting");
+        assert_eq!(loaded.events[0].description.as_deref(), Some("Weekly sync"));
+        assert_eq!(loaded.todos.len(), 1);
+        assert_eq!(loaded.todos[0].summary, "Fix bug");
+    }
+
+    #[test]
+    fn cache_wrong_key_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("event_cache.json");
+
+        let key_a = EncryptionKey::from_bytes([1u8; 32]);
+        let key_b = EncryptionKey::from_bytes([2u8; 32]);
+
+        let cache = EventCache {
+            timestamp: jiff::Zoned::now().timestamp().to_string(),
+            events: vec![],
+            todos: vec![],
+        };
+        let json = serde_json::to_string(&cache).unwrap();
+        let encrypted = crate::calendar::crypto::encrypt(json.as_bytes(), &key_a);
+        std::fs::write(&path, &encrypted).unwrap();
+
+        // Decrypting with wrong key must fail
+        let data = std::fs::read(&path).unwrap();
+        assert!(crate::calendar::crypto::decrypt(&data, &key_b).is_err());
+    }
+
+    #[test]
+    fn plaintext_cache_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("event_cache.json");
+
+        let events = vec![test_event()];
+        let todos = vec![test_todo()];
+
+        save_cache_to_path(&path, &events, &todos).unwrap();
+        let (loaded_events, loaded_todos) = load_cache_from_path(&path).unwrap();
+
+        assert_eq!(loaded_events.len(), 1);
+        assert_eq!(loaded_events[0].summary, "Team Meeting");
+        assert_eq!(loaded_todos.len(), 1);
+        assert_eq!(loaded_todos[0].summary, "Fix bug");
+    }
 }

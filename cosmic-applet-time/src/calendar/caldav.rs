@@ -4,10 +4,14 @@ use crate::calendar::config::{AuthMethod, CalDavCalendar};
 use crate::calendar::event::{parse_ics_events, parse_ics_todos, CalendarEvent, CalendarTodo};
 use crate::calendar::secrets::{self, SecretKind};
 use crate::calendar::{auth, SyncError};
-use quick_xml::events::Event as XmlEvent;
-use quick_xml::Reader;
+use cosmic_applets_config::calendar::discovery::{
+    xml_response_blocks, xml_extract_text, xml_extract_inner,
+    resolve_url, parse_calendar_list,
+    PROPFIND_PRINCIPAL, PROPFIND_HOME_SET, PROPFIND_CALENDARS,
+};
 use std::borrow::Cow;
 use std::sync::LazyLock;
+use zeroize::{Zeroize, Zeroizing};
 
 /// Shared HTTP client for CalDAV requests.
 /// Reused across all requests to enable connection pooling and keep-alive.
@@ -93,35 +97,6 @@ const VTODO_QUERY: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
     </c:comp-filter>
   </c:filter>
 </c:calendar-query>"#;
-
-/// PROPFIND body to discover the current-user-principal.
-const PROPFIND_PRINCIPAL: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
-<d:propfind xmlns:d="DAV:">
-  <d:prop>
-    <d:current-user-principal/>
-  </d:prop>
-</d:propfind>"#;
-
-/// PROPFIND body to discover the calendar-home-set.
-const PROPFIND_HOME_SET: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
-<d:propfind xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
-  <d:prop>
-    <c:calendar-home-set/>
-  </d:prop>
-</d:propfind>"#;
-
-/// PROPFIND body to list calendars and their properties.
-const PROPFIND_CALENDARS: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
-<d:propfind xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav"
-            xmlns:cs="http://calendarserver.org/ns/"
-            xmlns:ic="http://apple.com/ns/ical/">
-  <d:prop>
-    <d:resourcetype/>
-    <d:displayname/>
-    <ic:calendar-color/>
-    <cs:getctag/>
-  </d:prop>
-</d:propfind>"#;
 
 /// Discover all calendars available on a CalDAV server.
 ///
@@ -225,6 +200,38 @@ pub async fn fetch_todos(
     }
 
     Ok(all_todos)
+}
+
+/// Build the URL, headers, and body for a create-event PUT request.
+///
+/// Returns `(url, headers, body)` where headers is a vec of `(name, value)` pairs.
+pub(crate) fn build_create_event_request(
+    calendar_href: &str,
+    event: &CalendarEvent,
+) -> (String, Vec<(&'static str, String)>, String) {
+    let href = calendar_href.trim_end_matches('/');
+    let url = format!("{href}/{}.ics", event.uid);
+    let body = event.to_ics();
+    let headers = vec![
+        ("Content-Type", "text/calendar; charset=utf-8".to_string()),
+        ("If-None-Match", "*".to_string()),
+    ];
+    (url, headers, body)
+}
+
+/// Build the URL, headers, and body for an update-event PUT request.
+///
+/// Returns `(headers, body)` — the URL is the event's existing href.
+pub(crate) fn build_update_event_request(
+    event: &CalendarEvent,
+    etag: &str,
+) -> (Vec<(&'static str, String)>, String) {
+    let body = event.to_ics();
+    let headers = vec![
+        ("Content-Type", "text/calendar; charset=utf-8".to_string()),
+        ("If-Match", format!("\"{etag}\"")),
+    ];
+    (headers, body)
 }
 
 /// Create a new event on a CalDAV calendar via PUT.
@@ -519,6 +526,35 @@ pub async fn delete_event(
     Ok(())
 }
 
+/// Create a new VTODO on the CalDAV server.
+/// PUTs to `{calendar_href}/{uid}.ics` with `If-None-Match: *`.
+pub async fn create_todo(
+    calendar_href: &str,
+    todo: &CalendarTodo,
+    auth: &AuthMethod,
+    source_id: &str,
+    ca_cert_path: Option<&str>,
+) -> Result<(), SyncError> {
+    let client = get_client(ca_cert_path)?;
+    let href = calendar_href.trim_end_matches('/');
+    let url = format!("{href}/{}.ics", todo.uid);
+    let ics_body = todo.to_ics();
+
+    let result = put_event(&client, &url, &ics_body, auth, source_id).await;
+
+    match result {
+        Ok(()) => Ok(()),
+        Err(SyncError::AuthExpired(ref sid)) => {
+            if let Some(refreshed_token) = try_oidc_refresh(auth, sid).await? {
+                put_event_direct(&client, &url, &ics_body, &refreshed_token).await
+            } else {
+                Err(SyncError::AuthExpired(sid.clone()))
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// Toggle a VTODO's completion status via CalDAV PUT.
 pub async fn complete_todo(
     todo_href: &str,
@@ -652,65 +688,6 @@ async fn propfind(
         .text()
         .await
         .map_err(|e| SyncError::Other(format!("Failed to read PROPFIND response: {e}")))
-}
-
-/// Resolve a potentially-relative href against the server base URL.
-fn resolve_url(base: &str, href: &str) -> String {
-    if href.starts_with("http://") || href.starts_with("https://") {
-        href.to_string()
-    } else if href.starts_with('/') {
-        // Absolute path – combine with origin
-        if let Some(origin_end) = base.find("://").map(|i| {
-            base[i + 3..]
-                .find('/')
-                .map_or(base.len(), |slash| i + 3 + slash)
-        }) {
-            format!("{}{}", &base[..origin_end], href)
-        } else {
-            format!("{base}{href}")
-        }
-    } else {
-        format!("{base}/{href}")
-    }
-}
-
-/// Parse the PROPFIND Depth:1 response to extract calendar collections.
-fn parse_calendar_list(xml: &str, base: &str) -> Vec<CalDavCalendar> {
-    let mut calendars = Vec::new();
-
-    for block in xml_response_blocks(xml) {
-        // Only include calendar collections (resourcetype contains <calendar/>)
-        let is_calendar = block.contains("calendar")
-            && block.contains("resourcetype")
-            && block.contains("collection");
-
-        if is_calendar {
-            let href = xml_extract_text(&block, "href").unwrap_or_default();
-            let display_name = xml_extract_text(&block, "displayname")
-                .unwrap_or_else(|| href.trim_end_matches('/').rsplit('/').next().unwrap_or("Calendar").to_string());
-            let color = xml_extract_text(&block, "calendar-color");
-            let ctag = xml_extract_text(&block, "getctag");
-
-            if !href.is_empty() {
-                let full_href = if href.starts_with("http://") || href.starts_with("https://") {
-                    href
-                } else {
-                    resolve_url(base, &href)
-                };
-
-                calendars.push(CalDavCalendar {
-                    href: full_href,
-                    display_name,
-                    color,
-                    enabled: false, // new calendars are disabled until user opts in
-                    ctag,
-                    sync_token: None,
-                });
-            }
-        }
-    }
-
-    calendars
 }
 
 /// Fetch the current ctag for a single CalDAV calendar collection.
@@ -881,21 +858,21 @@ async fn apply_auth(
                 .await
                 .map_err(|e| SyncError::Other(format!("Failed to load password from keyring: {e}")))?
                 .unwrap_or_default();
-            request.basic_auth(username, Some(password))
+            request.basic_auth(username, Some(password.as_str()))
         }
         AuthMethod::Bearer => {
             let token = secrets::load_secret(source_id, SecretKind::BearerToken)
                 .await
                 .map_err(|e| SyncError::Other(format!("Failed to load bearer token from keyring: {e}")))?
                 .ok_or_else(|| SyncError::Other("Bearer token not found in keyring".into()))?;
-            request.bearer_auth(token)
+            request.bearer_auth(token.as_str())
         }
         AuthMethod::Oidc { has_token: true, .. } => {
             let token = secrets::load_secret(source_id, SecretKind::OidcAccessToken)
                 .await
                 .map_err(|e| SyncError::Other(format!("Failed to load OIDC token from keyring: {e}")))?
                 .ok_or_else(|| SyncError::AuthExpired(source_id.to_string()))?;
-            request.bearer_auth(token)
+            request.bearer_auth(token.as_str())
         }
         AuthMethod::Oidc {
             has_token: false, ..
@@ -921,7 +898,7 @@ fn apply_auth_direct(
 async fn try_oidc_refresh(
     auth: &AuthMethod,
     source_id: &str,
-) -> Result<Option<String>, SyncError> {
+) -> Result<Option<Zeroizing<String>>, SyncError> {
     let AuthMethod::Oidc {
         issuer_url,
         client_id,
@@ -948,9 +925,9 @@ async fn try_oidc_refresh(
         None
     };
 
-    match auth::oidc_refresh(issuer_url, client_id, client_secret.as_deref(), &refresh_token).await
+    match auth::oidc_refresh(issuer_url, client_id, client_secret.as_deref().map(String::as_str), &refresh_token).await
     {
-        Ok(tokens) => {
+        Ok(mut tokens) => {
             // Persist the new tokens
             if let Err(e) =
                 secrets::store_secret(source_id, SecretKind::OidcAccessToken, &tokens.access_token)
@@ -966,7 +943,12 @@ async fn try_oidc_refresh(
                 }
             }
             tracing::info!("Successfully refreshed OIDC token for source {source_id}");
-            Ok(Some(tokens.access_token))
+            // Wrap the access token in Zeroizing and zeroize the leftover fields
+            let access = Zeroizing::new(std::mem::take(&mut tokens.access_token));
+            if let Some(ref mut rt) = tokens.refresh_token {
+                rt.zeroize();
+            }
+            Ok(Some(access))
         }
         Err(e) => {
             tracing::warn!("OIDC token refresh failed for source {source_id}: {e}");
@@ -1004,215 +986,4 @@ fn extract_response_entries(xml: &str) -> Vec<ResponseEntry> {
     }
 
     entries
-}
-
-// ── quick-xml helpers ──────────────────────────────────────────────
-
-/// Split a WebDAV multistatus XML response into per-`<d:response>` blocks.
-///
-/// Returns the raw XML string for each response block, including tags.
-fn xml_response_blocks(xml: &str) -> Vec<String> {
-    let mut blocks = Vec::new();
-    let mut reader = Reader::from_str(xml);
-    let mut buf = Vec::new();
-    let mut depth: u32 = 0;
-    let mut in_response = false;
-    let mut block_buf = Vec::new();
-
-    loop {
-        match reader.read_event_into(&mut buf) {
-            Ok(XmlEvent::Start(ref e)) => {
-                let name_bytes = e.name().as_ref().to_vec();
-                let local = local_name(&name_bytes);
-                if local == b"response" && !in_response {
-                    in_response = true;
-                    depth = 1;
-                    block_buf.clear();
-                    block_buf.extend_from_slice(b"<response>");
-                } else if in_response {
-                    depth += 1;
-                    block_buf.extend_from_slice(b"<");
-                    block_buf.extend_from_slice(e.name().as_ref());
-                    for attr in e.attributes().flatten() {
-                        block_buf.extend_from_slice(b" ");
-                        block_buf.extend_from_slice(attr.key.as_ref());
-                        block_buf.extend_from_slice(b"=\"");
-                        block_buf.extend_from_slice(&attr.value);
-                        block_buf.extend_from_slice(b"\"");
-                    }
-                    block_buf.extend_from_slice(b">");
-                }
-            }
-            Ok(XmlEvent::End(ref e)) => {
-                let name_bytes = e.name().as_ref().to_vec();
-                let local = local_name(&name_bytes);
-                if in_response {
-                    if local == b"response" && depth == 1 {
-                        block_buf.extend_from_slice(b"</response>");
-                        if let Ok(s) = String::from_utf8(block_buf.clone()) {
-                            blocks.push(s);
-                        }
-                        in_response = false;
-                    } else {
-                        block_buf.extend_from_slice(b"</");
-                        block_buf.extend_from_slice(e.name().as_ref());
-                        block_buf.extend_from_slice(b">");
-                        depth -= 1;
-                    }
-                }
-            }
-            Ok(XmlEvent::Empty(ref e)) => {
-                if in_response {
-                    block_buf.extend_from_slice(b"<");
-                    block_buf.extend_from_slice(e.name().as_ref());
-                    for attr in e.attributes().flatten() {
-                        block_buf.extend_from_slice(b" ");
-                        block_buf.extend_from_slice(attr.key.as_ref());
-                        block_buf.extend_from_slice(b"=\"");
-                        block_buf.extend_from_slice(&attr.value);
-                        block_buf.extend_from_slice(b"\"");
-                    }
-                    block_buf.extend_from_slice(b"/>");
-                }
-            }
-            Ok(XmlEvent::Text(ref e)) => {
-                if in_response {
-                    if let Ok(t) = e.unescape() {
-                        // Re-escape so inner parsing works consistently
-                        block_buf.extend_from_slice(t.as_bytes());
-                    }
-                }
-            }
-            Ok(XmlEvent::CData(ref e)) => {
-                if in_response {
-                    block_buf.extend_from_slice(e.as_ref());
-                }
-            }
-            Ok(XmlEvent::Eof) => break,
-            Err(_) => break,
-            _ => {}
-        }
-        buf.clear();
-    }
-
-    blocks
-}
-
-/// Extract the text content of a simple element by its local name from an XML fragment.
-///
-/// Namespace-aware: matches `<d:href>`, `<D:href>`, `<href>` etc.
-fn xml_extract_text(xml: &str, local_name_target: &str) -> Option<String> {
-    let mut reader = Reader::from_str(xml);
-    let mut buf = Vec::new();
-    let target = local_name_target.as_bytes();
-
-    loop {
-        match reader.read_event_into(&mut buf) {
-            Ok(XmlEvent::Start(ref e)) => {
-                if local_name(e.name().as_ref()) == target {
-                    let mut text_buf = Vec::new();
-                    match reader.read_event_into(&mut text_buf) {
-                        Ok(XmlEvent::Text(t)) => {
-                            if let Ok(s) = t.unescape() {
-                                let trimmed = s.trim();
-                                if !trimmed.is_empty() {
-                                    return Some(trimmed.to_string());
-                                }
-                            }
-                        }
-                        Ok(XmlEvent::CData(t)) => {
-                            if let Ok(s) = std::str::from_utf8(t.as_ref()) {
-                                let trimmed = s.trim();
-                                if !trimmed.is_empty() {
-                                    return Some(trimmed.to_string());
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            Ok(XmlEvent::Eof) => break,
-            Err(_) => break,
-            _ => {}
-        }
-        buf.clear();
-    }
-
-    None
-}
-
-/// Extract the inner XML/text content of a named element (namespace-agnostic).
-///
-/// Unlike `xml_extract_text`, this captures all inner content including nested tags,
-/// which is needed for elements like `<current-user-principal>` that contain an `<href>`.
-fn xml_extract_inner(xml: &str, local_name_target: &str) -> Option<String> {
-    let mut reader = Reader::from_str(xml);
-    let mut buf = Vec::new();
-    let target = local_name_target.as_bytes();
-
-    loop {
-        match reader.read_event_into(&mut buf) {
-            Ok(XmlEvent::Start(ref e)) => {
-                if local_name(e.name().as_ref()) == target {
-                    let mut inner = Vec::new();
-                    let mut depth: u32 = 1;
-                    let mut inner_buf = Vec::new();
-                    loop {
-                        match reader.read_event_into(&mut inner_buf) {
-                            Ok(XmlEvent::Start(ref ie)) => {
-                                depth += 1;
-                                inner.extend_from_slice(b"<");
-                                inner.extend_from_slice(ie.name().as_ref());
-                                inner.extend_from_slice(b">");
-                            }
-                            Ok(XmlEvent::End(ref ie)) => {
-                                depth -= 1;
-                                if depth == 0 {
-                                    break;
-                                }
-                                inner.extend_from_slice(b"</");
-                                inner.extend_from_slice(ie.name().as_ref());
-                                inner.extend_from_slice(b">");
-                            }
-                            Ok(XmlEvent::Empty(ref ie)) => {
-                                inner.extend_from_slice(b"<");
-                                inner.extend_from_slice(ie.name().as_ref());
-                                inner.extend_from_slice(b"/>");
-                            }
-                            Ok(XmlEvent::Text(ref t)) => {
-                                if let Ok(s) = t.unescape() {
-                                    inner.extend_from_slice(s.as_bytes());
-                                }
-                            }
-                            Ok(XmlEvent::Eof) => break,
-                            Err(_) => break,
-                            _ => {}
-                        }
-                        inner_buf.clear();
-                    }
-                    if let Ok(s) = String::from_utf8(inner) {
-                        let trimmed = s.trim().to_string();
-                        if !trimmed.is_empty() {
-                            return Some(trimmed);
-                        }
-                    }
-                }
-            }
-            Ok(XmlEvent::Eof) => break,
-            Err(_) => break,
-            _ => {}
-        }
-        buf.clear();
-    }
-
-    None
-}
-
-/// Strip namespace prefix from a qualified XML name, returning the local part.
-fn local_name(qname: &[u8]) -> &[u8] {
-    match qname.iter().position(|&b| b == b':') {
-        Some(pos) => &qname[pos + 1..],
-        None => qname,
-    }
 }

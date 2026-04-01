@@ -4,9 +4,12 @@ pub mod auth;
 pub mod cache;
 pub mod caldav;
 pub mod config;
+pub mod crypto;
 pub mod event;
 pub mod ics;
 pub mod secrets;
+#[cfg(test)]
+mod tests;
 
 pub use config::{CalendarConfig, CALENDAR_CONFIG_ID};
 pub use event::{CalendarEvent, CalendarTodo};
@@ -56,25 +59,18 @@ struct CalendarMetaUpdate {
     sync_token: Option<String>,
 }
 
-/// Sync events and todos from every enabled source in the configuration.
+/// Compute the CalDAV time-range filter strings from today's date and the
+/// configured past/future day counts.
 ///
-/// Returns the sync result and an updated copy of sources whose CalDAV
-/// calendars had their `ctag` refreshed (caller should persist back to config).
-pub async fn sync_all(config: &CalendarConfig) -> (SyncResult, Vec<SourceConfig>) {
-    let mut all_events = Vec::new();
-    let mut all_todos = Vec::new();
-    let mut auth_expired = Vec::new();
-    let mut updated_sources = config.sources.clone();
-
-    let today = Zoned::now().date();
+/// Returns `(start_str, end_str)` in the format `YYYYMMDDTHHMMSSZ`.
+pub fn compute_sync_range(today: Date, past_days: u32, future_days: u32) -> (String, String) {
     let range_start = today
-        .checked_sub((config.sync_range_past_days as i64).days())
+        .checked_sub((past_days as i64).days())
         .unwrap_or(today);
     let range_end = today
-        .checked_add((config.sync_range_future_days as i64).days())
+        .checked_add((future_days as i64).days())
         .unwrap_or(today);
-
-    let time_range_str = (
+    (
         format!(
             "{}{:02}{:02}T000000Z",
             range_start.year(),
@@ -87,6 +83,30 @@ pub async fn sync_all(config: &CalendarConfig) -> (SyncResult, Vec<SourceConfig>
             range_end.month() as u8,
             range_end.day()
         ),
+    )
+}
+
+/// Sync events and todos from every enabled source in the configuration.
+///
+/// Returns the sync result and an updated copy of sources whose CalDAV
+/// calendars had their `ctag` refreshed (caller should persist back to config).
+pub async fn sync_all(config: &CalendarConfig, force_full: bool) -> (SyncResult, Vec<SourceConfig>) {
+    let mut all_events = Vec::new();
+    let mut all_todos = Vec::new();
+    let mut auth_expired = Vec::new();
+    let mut updated_sources = config.sources.clone();
+
+    let today = Zoned::now().date();
+    let range_start = today
+        .checked_sub((config.sync_range_past_days as i64).days())
+        .unwrap_or(today);
+    let range_end = today
+        .checked_add((config.sync_range_future_days as i64).days())
+        .unwrap_or(today);
+    let time_range_str = compute_sync_range(
+        today,
+        config.sync_range_past_days,
+        config.sync_range_future_days,
     );
 
     for (idx, source) in config.sources.iter().enumerate() {
@@ -94,7 +114,7 @@ pub async fn sync_all(config: &CalendarConfig) -> (SyncResult, Vec<SourceConfig>
             continue;
         }
 
-        match sync_source_with_ctag(source, Some((&time_range_str.0, &time_range_str.1))).await {
+        match sync_source_with_ctag(source, Some((&time_range_str.0, &time_range_str.1)), force_full).await {
             Ok((events, todos, meta_updates)) => {
                 all_events.extend(events);
                 all_todos.extend(todos);
@@ -143,6 +163,7 @@ pub async fn sync_all(config: &CalendarConfig) -> (SyncResult, Vec<SourceConfig>
 async fn sync_source_with_ctag(
     source: &SourceConfig,
     time_range: Option<(&str, &str)>,
+    force_full: bool,
 ) -> Result<(Vec<CalendarEvent>, Vec<CalendarTodo>, Vec<CalendarMetaUpdate>), SyncError> {
     match &source.source_type {
         SourceType::CalDav {
@@ -162,9 +183,10 @@ async fn sync_source_with_ctag(
             }
 
             for cal in enabled {
-                let color = cal.color.as_deref().unwrap_or(&source.color);
+                let color = if cal.color.is_empty() { &source.color } else { &cal.color };
 
                 // Try incremental sync via sync-collection if we have a sync-token
+                if !force_full {
                 if let Some(ref token) = cal.sync_token {
                     match caldav::sync_collection(
                         &cal.href, url, auth, &source.id, color, token, ca,
@@ -197,11 +219,16 @@ async fn sync_source_with_ctag(
                         }
                     }
                 }
+                } // !force_full
 
                 // Check server ctag — skip fetch if unchanged
-                let server_ctag = caldav::fetch_ctag(&cal.href, url, auth, &source.id, ca)
-                    .await
-                    .unwrap_or(None);
+                let server_ctag = if force_full {
+                    None
+                } else {
+                    caldav::fetch_ctag(&cal.href, url, auth, &source.id, ca)
+                        .await
+                        .unwrap_or(None)
+                };
                 if let (Some(cached), Some(server)) = (&cal.ctag, &server_ctag) {
                     if cached == server {
                         tracing::debug!(

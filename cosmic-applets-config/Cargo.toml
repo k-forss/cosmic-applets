@@ -7,3 +7,21 @@ edition = "2024"
 cosmic-config.workspace = true
 serde.workspace = true
 uuid = { version = "1", features = ["v4"] }
+
+# Optional deps for shared calendar auth/secrets modules
+secret-service = { version = "5", features = ["rt-tokio-crypto-rust"], optional = true }
+openidconnect = { version = "3", optional = true }
+tokio = { version = "1", features = ["net", "io-util", "time"], optional = true }
+tracing = { version = "0.1", optional = true }
+url = { version = "2", optional = true }
+zeroize = { version = "1", features = ["derive"], optional = true }
+
+# Optional deps for shared calendar discovery module
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots"], optional = true }
+quick-xml = { version = "0.37", optional = true }
+
+[features]
+default = []
+calendar-auth = ["secret-service", "openidconnect", "tokio", "tracing", "url", "zeroize"]
+calendar-discovery = ["reqwest", "quick-xml", "tracing"]
+calendar-crypto = ["zeroize"]
