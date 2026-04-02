@@ -3,6 +3,7 @@
 
 pub use cosmic_applets_config::time as config;
 
+pub mod calendar;
 mod localize;
 mod time;
 mod window;
