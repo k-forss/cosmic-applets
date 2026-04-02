@@ -53,6 +53,27 @@ static AUTOSIZE_MAIN_ID: LazyLock<Id> = LazyLock::new(|| Id::new("autosize-main"
 // and other specifiers have to be added depending on locales.
 const STRFTIME_SECONDS: &[char] = &['S', 'T', '+', 's'];
 
+/// Returns true if `format` contains a strftime specifier that renders seconds.
+/// Correctly handles `%%` escape sequences (literal `%`) so they are not
+/// mistaken for specifiers.
+fn strftime_has_seconds(format: &str) -> bool {
+    let mut chars = format.chars();
+    while let Some(c) = chars.next() {
+        if c == '%' {
+            match chars.next() {
+                Some('%') => {} // escaped literal `%`, not a specifier
+                Some(spec) => {
+                    if STRFTIME_SECONDS.contains(&spec) {
+                        return true;
+                    }
+                }
+                None => break,
+            }
+        }
+    }
+    false
+}
+
 fn get_system_locale() -> Locale {
     for var in ["LC_TIME", "LC_ALL", "LANG"] {
         if let Ok(locale_str) = std::env::var(var) {
@@ -117,14 +138,14 @@ impl Window {
                 date.month() as u8,
                 date.day() as u8,
             )
-            .unwrap(),
+            .expect("date values from jiff are always within ICU Gregorian calendar bounds"),
             time: Time::try_new(
                 self.now.hour() as u8,
                 self.now.minute() as u8,
                 self.now.second() as u8,
                 0,
             )
-            .unwrap(),
+            .expect("time components from jiff should be valid for ICU"),
         }
     }
 
@@ -147,10 +168,13 @@ impl Window {
         );
 
         let prefs = DateTimeFormatterPreferences::from(self.locale.clone());
-        let weekday = DateTimeFormatter::try_new(prefs, fieldsets::E::short()).unwrap();
+        let weekday = DateTimeFormatter::try_new(prefs, fieldsets::E::short())
+            .expect("weekday formatter should be constructable for the current locale");
 
         for i in 0..7 {
-            let date = first_day.checked_add(i.days()).unwrap();
+            let date = first_day
+                .checked_add(i.days())
+                .expect("week-header date should be within jiff's supported range");
             let datetime = self.create_datetime(&date);
             calendar = calendar.push(
                 text::caption(weekday.format(&datetime).to_string())
@@ -189,6 +213,18 @@ impl Window {
             .flatten()
     }
 
+    /// Build `DateTimeFormatterPreferences` for displaying time, with the
+    /// user's preferred hour cycle applied.
+    fn time_prefs(&self) -> DateTimeFormatterPreferences {
+        let mut prefs = DateTimeFormatterPreferences::from(self.locale.clone());
+        prefs.hour_cycle = Some(if self.config.military_time {
+            HourCycle::H23
+        } else {
+            HourCycle::H12
+        });
+        prefs
+    }
+
     fn vertical_layout(&self) -> Element<'_, Message> {
         let elements: Vec<Element<'_, Message>> = if let Some(strftime) = self.maybe_strftime() {
             strftime
@@ -199,16 +235,11 @@ impl Window {
             let mut elements = Vec::new();
             let date = self.now.date();
             let datetime = self.create_datetime(&date);
-            let mut prefs = DateTimeFormatterPreferences::from(self.locale.clone());
-            prefs.hour_cycle = Some(if self.config.military_time {
-                HourCycle::H23
-            } else {
-                HourCycle::H12
-            });
+            let prefs = self.time_prefs();
 
             if self.config.show_date_in_top_panel {
                 let formatted_date = DateTimeFormatter::try_new(prefs, fieldsets::MD::medium())
-                    .unwrap()
+                    .expect("date formatter should be constructable for the current locale")
                     .format(&datetime)
                     .to_string();
 
@@ -226,7 +257,7 @@ impl Window {
                 fs = fs.with_time_precision(TimePrecision::Minute);
             }
             let formatted_time = DateTimeFormatter::try_new(prefs, fs)
-                .unwrap()
+                .expect("time formatter should be constructable for the current locale")
                 .format(&datetime)
                 .to_string();
 
@@ -261,12 +292,7 @@ impl Window {
             strftime
         } else {
             let datetime = self.create_datetime(&self.now.date());
-            let mut prefs = DateTimeFormatterPreferences::from(self.locale.clone());
-            prefs.hour_cycle = Some(if self.config.military_time {
-                HourCycle::H23
-            } else {
-                HourCycle::H12
-            });
+            let prefs = self.time_prefs();
 
             if self.config.show_date_in_top_panel {
                 if self.config.show_weekday {
@@ -275,7 +301,7 @@ impl Window {
                         fs = fs.with_time_precision(TimePrecision::Minute);
                     }
                     DateTimeFormatter::try_new(prefs, fs)
-                        .unwrap()
+                        .expect("date+weekday+time formatter should be constructable for the current locale")
                         .format(&datetime)
                         .to_string()
                 } else {
@@ -284,7 +310,9 @@ impl Window {
                         fs = fs.with_time_precision(TimePrecision::Minute);
                     }
                     DateTimeFormatter::try_new(prefs, fs)
-                        .unwrap()
+                        .expect(
+                            "date+time formatter should be constructable for the current locale",
+                        )
                         .format(&datetime)
                         .to_string()
                 }
@@ -294,7 +322,7 @@ impl Window {
                     fs = fs.with_time_precision(TimePrecision::Minute);
                 }
                 DateTimeFormatter::try_new(prefs, fs)
-                    .unwrap()
+                    .expect("time formatter should be constructable for the current locale")
                     .format(&datetime)
                     .to_string()
             }
@@ -491,8 +519,21 @@ impl cosmic::Application for Window {
         fn wake_from_sleep_subscription() -> Subscription<Message> {
             Subscription::run_with("wake-from-suspend-sub", |_| {
                 stream::channel(1, |mut output| async move {
-                    if let Err(err) = wake_from_sleep(&mut output).await {
-                        tracing::error!(?err, "Failed to subscribe to wake-from-sleep signal");
+                    loop {
+                        match wake_from_sleep(&mut output).await {
+                            Ok(()) => {
+                                tracing::warn!(
+                                    "Wake-from-sleep signal stream ended; retrying in one minute"
+                                );
+                            }
+                            Err(err) => {
+                                tracing::error!(
+                                    ?err,
+                                    "Failed to subscribe to wake-from-sleep signal; retrying in one minute"
+                                );
+                            }
+                        }
+                        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
                     }
                 })
             })
@@ -527,7 +568,9 @@ impl cosmic::Application for Window {
                     self.popup = Some(new_id);
 
                     let mut popup_settings = self.core.applet.get_popup_settings(
-                        self.core.main_window_id().unwrap(),
+                        self.core
+                            .main_window_id()
+                            .expect("applet should always have a main window"),
                         new_id,
                         None,
                         None,
@@ -632,25 +675,23 @@ impl cosmic::Application for Window {
                 Task::none()
             }
             Message::ConfigChanged(c) => {
-                // Don't interrupt the tick subscription unless necessary
+                // Don't interrupt the tick subscription unless necessary.
+                // Tick at 1-second intervals only when seconds will be displayed:
+                //   - a custom strftime format that includes a seconds specifier, or
+                //   - no custom format and the user has show_seconds enabled.
+                // In all other cases, a 60-second interval is sufficient.
                 self.show_seconds_tx.send_if_modified(|show_seconds| {
-                    if !c.format_strftime.is_empty() {
-                        if c.format_strftime.split('%').any(|s| {
-                            STRFTIME_SECONDS.contains(&s.chars().next().unwrap_or_default())
-                        }) && !*show_seconds
-                        {
-                            // The strftime formatter contains a seconds specifier. Force enable
-                            // ticking per seconds internally regardless of the user setting.
-                            // This does not change the user's setting. It's invisible to the user.
-                            *show_seconds = true;
-                            true
-                        } else {
-                            false
-                        }
-                    } else if *show_seconds == c.show_seconds {
+                    let desired = if !c.format_strftime.is_empty() {
+                        // Custom format overrides the user's show_seconds preference;
+                        // only use per-second ticking when the format actually renders seconds.
+                        strftime_has_seconds(&c.format_strftime)
+                    } else {
+                        c.show_seconds
+                    };
+                    if *show_seconds == desired {
                         false
                     } else {
-                        *show_seconds = c.show_seconds;
+                        *show_seconds = desired;
                         true
                     }
                 });
@@ -715,14 +756,14 @@ impl cosmic::Application for Window {
 
         let date = text(
             DateTimeFormatter::try_new(prefs, fieldsets::YMD::long())
-                .unwrap()
+                .expect("date formatter should be constructable for the current locale")
                 .format(&datetime)
                 .to_string(),
         )
         .size(18);
         let day_of_week = text::body(
             DateTimeFormatter::try_new(prefs, fieldsets::E::long())
-                .unwrap()
+                .expect("weekday formatter should be constructable for the current locale")
                 .format(&datetime)
                 .to_string(),
         );
@@ -787,5 +828,42 @@ fn date_button(day: i8, is_month: bool, is_day: bool, is_today: bool) -> Button<
         button.on_press(Message::SelectDay(day))
     } else {
         button
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::strftime_has_seconds;
+
+    #[test]
+    fn test_seconds_specifiers_detected() {
+        assert!(strftime_has_seconds("%S"));
+        assert!(strftime_has_seconds("%T"));
+        assert!(strftime_has_seconds("%+"));
+        assert!(strftime_has_seconds("%s"));
+        assert!(strftime_has_seconds("%H:%M:%S"));
+    }
+
+    #[test]
+    fn test_escaped_percent_not_a_specifier() {
+        // %%S is a literal `%` followed by the character `S`, not a seconds specifier
+        assert!(!strftime_has_seconds("%%S"));
+        // %%%%S is two literal `%` characters followed by `S`
+        assert!(!strftime_has_seconds("%%%%S"));
+        // %%%S: first `%%` is a literal `%`, then `%S` is a real seconds specifier
+        assert!(strftime_has_seconds("%%%S"));
+    }
+
+    #[test]
+    fn test_non_seconds_specifiers() {
+        assert!(!strftime_has_seconds("%H:%M"));
+        assert!(!strftime_has_seconds("%Y-%m-%d"));
+        assert!(!strftime_has_seconds(""));
+    }
+
+    #[test]
+    fn test_trailing_percent_does_not_panic() {
+        // A trailing `%` with no following character should not panic or detect seconds
+        assert!(!strftime_has_seconds("trailing%"));
     }
 }
