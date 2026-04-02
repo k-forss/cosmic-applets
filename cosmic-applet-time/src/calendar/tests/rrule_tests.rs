@@ -1,4 +1,4 @@
-use crate::calendar::event::{expand_recurring, parse_ics_events, CalendarEvent};
+use crate::calendar::event::{CalendarEvent, expand_recurring, parse_ics_events};
 use jiff::civil::Date;
 
 /// Helper: build a minimal CalendarEvent with an RRULE, starting on the given date.
@@ -77,7 +77,12 @@ fn weekly_byday_count_6() {
     let ev = event_with_rrule("20260112T090000Z", "FREQ=WEEKLY;BYDAY=MO,WE,FR;COUNT=6");
     let (start, end) = wide_range();
     let expanded = expand_recurring(vec![ev], start, end);
-    assert_eq!(expanded.len(), 6, "expected 6 occurrences, got {}", expanded.len());
+    assert_eq!(
+        expanded.len(),
+        6,
+        "expected 6 occurrences, got {}",
+        expanded.len()
+    );
     for e in &expanded {
         let wd = e.date().weekday();
         assert!(
@@ -146,11 +151,8 @@ fn daily_until() {
 // EXDATE
 #[test]
 fn daily_exdate_skipped() {
-    let ev = event_with_rrule_and_exdate(
-        "20260110T090000Z",
-        "FREQ=DAILY;COUNT=5",
-        "20260112T090000Z",
-    );
+    let ev =
+        event_with_rrule_and_exdate("20260110T090000Z", "FREQ=DAILY;COUNT=5", "20260112T090000Z");
     let (start, end) = wide_range();
     let expanded = expand_recurring(vec![ev], start, end);
     // 5 occurrences minus the excluded Jan 12 = 4
@@ -179,7 +181,11 @@ fn iteration_cap_1000() {
     let start = Date::new(2026, 1, 1).unwrap();
     let end = Date::new(2050, 12, 31).unwrap();
     let expanded = expand_recurring(vec![ev], start, end);
-    assert!(expanded.len() <= 1000, "should cap at 1000, got {}", expanded.len());
+    assert!(
+        expanded.len() <= 1000,
+        "should cap at 1000, got {}",
+        expanded.len()
+    );
 }
 
 // leap year handling: monthly starting Jan 31 through Feb
@@ -220,6 +226,10 @@ fn monthly_byday_last_friday() {
     for e in &expanded {
         assert_eq!(e.date().weekday(), jiff::civil::Weekday::Friday);
         // Last Friday — day should be >= 22
-        assert!(e.date().day() >= 22, "last Friday of month should be day >= 22, got {}", e.date().day());
+        assert!(
+            e.date().day() >= 22,
+            "last Friday of month should be day >= 22, got {}",
+            e.date().day()
+        );
     }
 }

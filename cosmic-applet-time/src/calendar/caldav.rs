@@ -1,13 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use crate::calendar::config::{AuthMethod, CalDavCalendar};
-use crate::calendar::event::{parse_ics_events, parse_ics_todos, CalendarEvent, CalendarTodo};
+use crate::calendar::event::{CalendarEvent, CalendarTodo, parse_ics_events, parse_ics_todos};
 use crate::calendar::secrets::{self, SecretKind};
-use crate::calendar::{auth, SyncError};
+use crate::calendar::{SyncError, auth};
 use cosmic_applets_config::calendar::discovery::{
-    xml_response_blocks, xml_extract_text, xml_extract_inner,
-    resolve_url, parse_calendar_list,
-    PROPFIND_PRINCIPAL, PROPFIND_HOME_SET, PROPFIND_CALENDARS,
+    PROPFIND_CALENDARS, PROPFIND_HOME_SET, PROPFIND_PRINCIPAL, parse_calendar_list, resolve_url,
+    xml_extract_inner, xml_extract_text, xml_response_blocks,
 };
 use std::borrow::Cow;
 use std::sync::LazyLock;
@@ -122,7 +121,15 @@ pub async fn discover_calendars(
     let principal_url = resolve_url(base, &principal_href);
 
     // Step 2: Discover calendar-home-set
-    let home_body = propfind(&client, &principal_url, "0", PROPFIND_HOME_SET, auth, source_id).await?;
+    let home_body = propfind(
+        &client,
+        &principal_url,
+        "0",
+        PROPFIND_HOME_SET,
+        auth,
+        source_id,
+    )
+    .await?;
     let home_href = xml_extract_inner(&home_body, "calendar-home-set")
         .and_then(|block| xml_extract_text(&block, "href"))
         .unwrap_or_default();
@@ -258,7 +265,7 @@ pub async fn create_event(
         Err(SyncError::AuthExpired(ref sid)) => {
             // Try OIDC token refresh and retry once
             if let Some(refreshed_token) = try_oidc_refresh(auth, sid).await? {
-                put_event_direct(&client, &url, &ics_body, &refreshed_token).await
+                put_event_direct(&client, &url, &ics_body, &refreshed_token, sid).await
             } else {
                 Err(SyncError::AuthExpired(sid.clone()))
             }
@@ -308,6 +315,7 @@ async fn put_event_direct(
     url: &str,
     ics_body: &str,
     access_token: &str,
+    source_id: &str,
 ) -> Result<(), SyncError> {
     let request = client
         .put(url)
@@ -323,7 +331,7 @@ async fn put_event_direct(
         .map_err(|e| SyncError::Other(format!("CalDAV PUT retry failed: {e}")))?;
 
     if response.status() == reqwest::StatusCode::UNAUTHORIZED {
-        return Err(SyncError::AuthExpired("unknown".to_string()));
+        return Err(SyncError::AuthExpired(source_id.to_string()));
     }
 
     let status = response.status();
@@ -546,7 +554,7 @@ pub async fn create_todo(
         Ok(()) => Ok(()),
         Err(SyncError::AuthExpired(ref sid)) => {
             if let Some(refreshed_token) = try_oidc_refresh(auth, sid).await? {
-                put_event_direct(&client, &url, &ics_body, &refreshed_token).await
+                put_event_direct(&client, &url, &ics_body, &refreshed_token, sid).await
             } else {
                 Err(SyncError::AuthExpired(sid.clone()))
             }
@@ -643,7 +651,8 @@ async fn propfind(
     if response.status() == reqwest::StatusCode::UNAUTHORIZED {
         // Try refreshing OIDC token if applicable
         if let Some(refreshed_auth) = try_oidc_refresh(auth, source_id).await? {
-            let method = reqwest::Method::from_bytes(b"PROPFIND").expect("PROPFIND is a valid method");
+            let method =
+                reqwest::Method::from_bytes(b"PROPFIND").expect("PROPFIND is a valid method");
             let mut retry = client
                 .request(method, url)
                 .header("Depth", depth)
@@ -773,9 +782,7 @@ pub async fn sync_collection(
     let status = response.status();
 
     // 403 or 409 means the token is stale/invalid — fall back to full sync
-    if status == reqwest::StatusCode::FORBIDDEN
-        || status == reqwest::StatusCode::CONFLICT
-    {
+    if status == reqwest::StatusCode::FORBIDDEN || status == reqwest::StatusCode::CONFLICT {
         tracing::info!("sync-token invalid for '{calendar_href}', falling back to full sync");
         return Ok(None);
     }
@@ -818,8 +825,7 @@ pub async fn sync_collection(
         }
 
         let data = xml_extract_text(&block, "calendar-data");
-        let etag = xml_extract_text(&block, "getetag")
-            .map(|e| e.trim_matches('"').to_string());
+        let etag = xml_extract_text(&block, "getetag").map(|e| e.trim_matches('"').to_string());
 
         if let Some(calendar_data) = data {
             let mut parsed_events = parse_ics_events(&calendar_data, source_id, color);
@@ -856,21 +862,29 @@ async fn apply_auth(
         AuthMethod::Basic { username } => {
             let password = secrets::load_secret(source_id, SecretKind::Password)
                 .await
-                .map_err(|e| SyncError::Other(format!("Failed to load password from keyring: {e}")))?
-                .unwrap_or_default();
+                .map_err(|e| {
+                    SyncError::Other(format!("Failed to load password from keyring: {e}"))
+                })?
+                .ok_or_else(|| SyncError::Other("Password not found in keyring".into()))?;
             request.basic_auth(username, Some(password.as_str()))
         }
         AuthMethod::Bearer => {
             let token = secrets::load_secret(source_id, SecretKind::BearerToken)
                 .await
-                .map_err(|e| SyncError::Other(format!("Failed to load bearer token from keyring: {e}")))?
+                .map_err(|e| {
+                    SyncError::Other(format!("Failed to load bearer token from keyring: {e}"))
+                })?
                 .ok_or_else(|| SyncError::Other("Bearer token not found in keyring".into()))?;
             request.bearer_auth(token.as_str())
         }
-        AuthMethod::Oidc { has_token: true, .. } => {
+        AuthMethod::Oidc {
+            has_token: true, ..
+        } => {
             let token = secrets::load_secret(source_id, SecretKind::OidcAccessToken)
                 .await
-                .map_err(|e| SyncError::Other(format!("Failed to load OIDC token from keyring: {e}")))?
+                .map_err(|e| {
+                    SyncError::Other(format!("Failed to load OIDC token from keyring: {e}"))
+                })?
                 .ok_or_else(|| SyncError::AuthExpired(source_id.to_string()))?;
             request.bearer_auth(token.as_str())
         }
@@ -925,7 +939,13 @@ async fn try_oidc_refresh(
         None
     };
 
-    match auth::oidc_refresh(issuer_url, client_id, client_secret.as_deref().map(String::as_str), &refresh_token).await
+    match auth::oidc_refresh(
+        issuer_url,
+        client_id,
+        client_secret.as_deref().map(String::as_str),
+        &refresh_token,
+    )
+    .await
     {
         Ok(mut tokens) => {
             // Persist the new tokens
@@ -972,8 +992,7 @@ fn extract_response_entries(xml: &str) -> Vec<ResponseEntry> {
 
     for block in xml_response_blocks(xml) {
         let href = xml_extract_text(&block, "href");
-        let etag = xml_extract_text(&block, "getetag")
-            .map(|e| e.trim_matches('"').to_string());
+        let etag = xml_extract_text(&block, "getetag").map(|e| e.trim_matches('"').to_string());
         let data = xml_extract_text(&block, "calendar-data");
 
         if let Some(calendar_data) = data {

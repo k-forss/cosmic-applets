@@ -47,16 +47,29 @@ const PROPFIND_CALENDARS_RESPONSE: &str = r#"<?xml version="1.0" encoding="UTF-8
 fn parse_propfind_calendar_list() {
     let base = "https://dav.example.com";
     let calendars = parse_calendar_list(PROPFIND_CALENDARS_RESPONSE, base);
-    assert_eq!(calendars.len(), 2, "should find 2 calendars (not the root collection)");
+    assert_eq!(
+        calendars.len(),
+        2,
+        "should find 2 calendars (not the root collection)"
+    );
 
-    let personal = calendars.iter().find(|c| c.display_name == "Personal").unwrap();
-    assert_eq!(personal.href, "https://dav.example.com/dav/calendars/user/personal/");
+    let personal = calendars
+        .iter()
+        .find(|c| c.display_name == "Personal")
+        .unwrap();
+    assert_eq!(
+        personal.href,
+        "https://dav.example.com/dav/calendars/user/personal/"
+    );
     assert_eq!(personal.color, "#FF0000FF");
     assert_eq!(personal.ctag.as_deref(), Some("ctag-abc-123"));
     assert!(!personal.enabled);
 
     let work = calendars.iter().find(|c| c.display_name == "Work").unwrap();
-    assert_eq!(work.href, "https://dav.example.com/dav/calendars/user/work/");
+    assert_eq!(
+        work.href,
+        "https://dav.example.com/dav/calendars/user/work/"
+    );
     assert_eq!(work.color, "#0000FFFF");
 }
 
@@ -151,7 +164,10 @@ fn parse_sync_collection() {
 
     // sync-token is outside response blocks, extract from full XML
     let new_token = xml_extract_text(SYNC_RESPONSE, "sync-token");
-    assert_eq!(new_token.as_deref(), Some("http://example.com/sync/new-token"));
+    assert_eq!(
+        new_token.as_deref(),
+        Some("http://example.com/sync/new-token")
+    );
 }
 
 #[test]
@@ -309,7 +325,10 @@ fn build_create_event_has_if_none_match() {
     assert!(body.contains("UID:etag-test-uid-123"));
 
     let if_none_match = headers.iter().find(|(k, _)| *k == "If-None-Match");
-    assert!(if_none_match.is_some(), "If-None-Match header must be present");
+    assert!(
+        if_none_match.is_some(),
+        "If-None-Match header must be present"
+    );
     assert_eq!(if_none_match.unwrap().1, "*");
 }
 

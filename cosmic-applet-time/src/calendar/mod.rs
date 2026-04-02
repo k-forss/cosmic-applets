@@ -11,11 +11,11 @@ pub mod secrets;
 #[cfg(test)]
 mod tests;
 
-pub use config::{CalendarConfig, CALENDAR_CONFIG_ID};
+pub use config::{CALENDAR_CONFIG_ID, CalendarConfig};
 pub use event::{CalendarEvent, CalendarTodo};
 
 use config::{CalDavCalendar, SourceConfig, SourceType};
-use jiff::{civil::Date, ToSpan, Zoned};
+use jiff::{ToSpan, Zoned, civil::Date};
 use std::collections::BTreeMap;
 
 /// Structured error type for calendar sync operations.
@@ -90,7 +90,10 @@ pub fn compute_sync_range(today: Date, past_days: u32, future_days: u32) -> (Str
 ///
 /// Returns the sync result and an updated copy of sources whose CalDAV
 /// calendars had their `ctag` refreshed (caller should persist back to config).
-pub async fn sync_all(config: &CalendarConfig, force_full: bool) -> (SyncResult, Vec<SourceConfig>) {
+pub async fn sync_all(
+    config: &CalendarConfig,
+    force_full: bool,
+) -> (SyncResult, Vec<SourceConfig>) {
     let mut all_events = Vec::new();
     let mut all_todos = Vec::new();
     let mut auth_expired = Vec::new();
@@ -114,7 +117,13 @@ pub async fn sync_all(config: &CalendarConfig, force_full: bool) -> (SyncResult,
             continue;
         }
 
-        match sync_source_with_ctag(source, Some((&time_range_str.0, &time_range_str.1)), force_full).await {
+        match sync_source_with_ctag(
+            source,
+            Some((&time_range_str.0, &time_range_str.1)),
+            force_full,
+        )
+        .await
+        {
             Ok((events, todos, meta_updates)) => {
                 all_events.extend(events);
                 all_todos.extend(todos);
@@ -124,7 +133,8 @@ pub async fn sync_all(config: &CalendarConfig, force_full: bool) -> (SyncResult,
                         &mut updated_sources[idx].source_type
                     {
                         for update in meta_updates {
-                            if let Some(cal) = calendars.iter_mut().find(|c| c.href == update.href) {
+                            if let Some(cal) = calendars.iter_mut().find(|c| c.href == update.href)
+                            {
                                 if let Some(new_ctag) = update.ctag {
                                     cal.ctag = Some(new_ctag);
                                 }
@@ -164,7 +174,14 @@ async fn sync_source_with_ctag(
     source: &SourceConfig,
     time_range: Option<(&str, &str)>,
     force_full: bool,
-) -> Result<(Vec<CalendarEvent>, Vec<CalendarTodo>, Vec<CalendarMetaUpdate>), SyncError> {
+) -> Result<
+    (
+        Vec<CalendarEvent>,
+        Vec<CalendarTodo>,
+        Vec<CalendarMetaUpdate>,
+    ),
+    SyncError,
+> {
     match &source.source_type {
         SourceType::CalDav {
             url,
@@ -174,8 +191,7 @@ async fn sync_source_with_ctag(
             let mut events = Vec::new();
             let mut todos = Vec::new();
             let mut meta_updates = Vec::new();
-            let enabled: Vec<&CalDavCalendar> =
-                calendars.iter().filter(|c| c.enabled).collect();
+            let enabled: Vec<&CalDavCalendar> = calendars.iter().filter(|c| c.enabled).collect();
             let ca = source.ca_cert_path.as_deref();
 
             if enabled.is_empty() {
@@ -183,43 +199,47 @@ async fn sync_source_with_ctag(
             }
 
             for cal in enabled {
-                let color = if cal.color.is_empty() { &source.color } else { &cal.color };
+                let color = if cal.color.is_empty() {
+                    &source.color
+                } else {
+                    &cal.color
+                };
 
                 // Try incremental sync via sync-collection if we have a sync-token
                 if !force_full {
-                if let Some(ref token) = cal.sync_token {
-                    match caldav::sync_collection(
-                        &cal.href, url, auth, &source.id, color, token, ca,
-                    )
-                    .await
-                    {
-                        Ok(Some(result)) => {
-                            events.extend(result.events);
-                            todos.extend(result.todos);
-                            meta_updates.push(CalendarMetaUpdate {
-                                href: cal.href.clone(),
-                                ctag: None,
-                                sync_token: result.new_sync_token,
-                            });
-                            continue;
-                        }
-                        Ok(None) => {
-                            // Token invalid, fall through to full sync
-                            tracing::info!(
-                                "sync-token expired for '{}', doing full sync",
-                                cal.display_name
-                            );
-                        }
-                        Err(e @ SyncError::AuthExpired(_)) => return Err(e),
-                        Err(SyncError::Other(e)) => {
-                            tracing::warn!(
-                                "sync-collection failed for '{}': {e}, falling back",
-                                cal.display_name
-                            );
+                    if let Some(ref token) = cal.sync_token {
+                        match caldav::sync_collection(
+                            &cal.href, url, auth, &source.id, color, token, ca,
+                        )
+                        .await
+                        {
+                            Ok(Some(result)) => {
+                                events.extend(result.events);
+                                todos.extend(result.todos);
+                                meta_updates.push(CalendarMetaUpdate {
+                                    href: cal.href.clone(),
+                                    ctag: None,
+                                    sync_token: result.new_sync_token,
+                                });
+                                continue;
+                            }
+                            Ok(None) => {
+                                // Token invalid, fall through to full sync
+                                tracing::info!(
+                                    "sync-token expired for '{}', doing full sync",
+                                    cal.display_name
+                                );
+                            }
+                            Err(e @ SyncError::AuthExpired(_)) => return Err(e),
+                            Err(SyncError::Other(e)) => {
+                                tracing::warn!(
+                                    "sync-collection failed for '{}': {e}, falling back",
+                                    cal.display_name
+                                );
+                            }
                         }
                     }
                 }
-                } // !force_full
 
                 // Check server ctag — skip fetch if unchanged
                 let server_ctag = if force_full {
@@ -274,9 +294,15 @@ async fn sync_source_with_ctag(
             Ok((events, todos, meta_updates))
         }
         SourceType::IcsUrl { url, auth } => {
-            let events = ics::fetch_ics_url(url, &source.id, &source.color, auth, source.ca_cert_path.as_deref())
-                .await
-                .map_err(SyncError::Other)?;
+            let events = ics::fetch_ics_url(
+                url,
+                &source.id,
+                &source.color,
+                auth,
+                source.ca_cert_path.as_deref(),
+            )
+            .await
+            .map_err(SyncError::Other)?;
             Ok((events, Vec::new(), Vec::new()))
         }
         SourceType::IcsFile { path } => {
@@ -302,7 +328,8 @@ pub async fn discover_and_merge(source: &mut SourceConfig) -> Result<(), SyncErr
         return Ok(());
     };
 
-    let discovered = caldav::discover_calendars(url, auth, &source_id, source.ca_cert_path.as_deref()).await?;
+    let discovered =
+        caldav::discover_calendars(url, auth, &source_id, source.ca_cert_path.as_deref()).await?;
 
     for new_cal in discovered {
         if !calendars.iter().any(|c| c.href == new_cal.href) {

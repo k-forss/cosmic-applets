@@ -3,8 +3,8 @@
 //! Shared CalDAV discovery helpers: PROPFIND constants, XML parsing, HTTP client.
 
 use super::CalDavCalendar;
-use quick_xml::events::Event as XmlEvent;
 use quick_xml::Reader;
+use quick_xml::events::Event as XmlEvent;
 use std::borrow::Cow;
 use std::sync::LazyLock;
 
@@ -140,7 +140,7 @@ pub async fn propfind_inline(
     if response.status() == reqwest::StatusCode::UNAUTHORIZED {
         let body = response.text().await.unwrap_or_default();
         tracing::error!("CalDAV 401 Unauthorized (inline) from {url}: {body}");
-        return Err(DiscoveryError::AuthExpired("form".to_string()));
+        return Err(DiscoveryError::AuthExpired(url.to_string()));
     }
 
     if !response.status().is_success() {

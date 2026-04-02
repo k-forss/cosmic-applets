@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
-use jiff::{civil::Date, fmt::strtime, tz::TimeZone, ToSpan, Zoned};
+use jiff::{ToSpan, Zoned, civil::Date, fmt::strtime, tz::TimeZone};
 
 #[derive(Debug, Clone)]
 pub struct CalendarEvent {
@@ -169,14 +169,11 @@ fn parse_event(
     let all_day = dtstart_value.len() == 8;
     let dtstart = parse_ics_datetime(dtstart_value, dtstart_tzid.as_deref())?;
 
-    let dtend = props
-        .iter()
-        .find(|p| p.name == "DTEND")
-        .and_then(|p| {
-            let value = p.value.as_deref()?;
-            let tzid = get_param(p, "TZID");
-            parse_ics_datetime(value, tzid.as_deref())
-        });
+    let dtend = props.iter().find(|p| p.name == "DTEND").and_then(|p| {
+        let value = p.value.as_deref()?;
+        let tzid = get_param(p, "TZID");
+        parse_ics_datetime(value, tzid.as_deref())
+    });
 
     Some(CalendarEvent {
         uid,
@@ -394,14 +391,11 @@ fn parse_todo(
     let status = get_prop(props, "STATUS").unwrap_or_default();
     let priority = get_prop(props, "PRIORITY").and_then(|p| p.parse().ok());
 
-    let due = props
-        .iter()
-        .find(|p| p.name == "DUE")
-        .and_then(|p| {
-            let value = p.value.as_deref()?;
-            let tzid = get_param(p, "TZID");
-            parse_ics_datetime(value, tzid.as_deref())
-        });
+    let due = props.iter().find(|p| p.name == "DUE").and_then(|p| {
+        let value = p.value.as_deref()?;
+        let tzid = get_param(p, "TZID");
+        parse_ics_datetime(value, tzid.as_deref())
+    });
 
     Some(CalendarTodo {
         uid,
@@ -510,7 +504,11 @@ fn parse_rrule_string(rrule: &str) -> Option<ParsedRRule> {
 /// Parse a BYDAY token like "MO", "2TU", "-1FR" into (optional ordinal, weekday).
 fn parse_byday_token(s: &str) -> Option<(Option<i8>, jiff::civil::Weekday)> {
     use jiff::civil::Weekday;
-    let day_part = if s.len() >= 2 { &s[s.len() - 2..] } else { return None };
+    let day_part = if s.len() >= 2 {
+        &s[s.len() - 2..]
+    } else {
+        return None;
+    };
     let weekday = match day_part {
         "MO" => Weekday::Monday,
         "TU" => Weekday::Tuesday,
@@ -546,7 +544,10 @@ pub fn expand_recurring(
             if !event.rdates.is_empty() {
                 result.push(event.clone());
                 for rdate in &event.rdates {
-                    if *rdate >= range_start && *rdate <= range_end && !event.exdates.contains(rdate) {
+                    if *rdate >= range_start
+                        && *rdate <= range_end
+                        && !event.exdates.contains(rdate)
+                    {
                         if *rdate != event.date() {
                             if let Some(occ) = make_occurrence(&event, *rdate) {
                                 result.push(occ);
@@ -566,7 +567,8 @@ pub fn expand_recurring(
             continue;
         };
 
-        let has_by_rules = !rule.by_day.is_empty() || !rule.by_month.is_empty() || !rule.by_monthday.is_empty();
+        let has_by_rules =
+            !rule.by_day.is_empty() || !rule.by_month.is_empty() || !rule.by_monthday.is_empty();
 
         let original_date = event.date();
         let mut current = original_date;
@@ -591,10 +593,14 @@ pub fn expand_recurring(
                         break;
                     }
                     if let Some(until) = rule.until {
-                        if candidate > until { break; }
+                        if candidate > until {
+                            break;
+                        }
                     }
                     if let Some(ref mut remaining) = count_remaining {
-                        if *remaining <= 0 { break; }
+                        if *remaining <= 0 {
+                            break;
+                        }
                         *remaining -= 1;
                     }
                     if candidate >= range_start && !event.exdates.contains(&candidate) {
@@ -675,7 +681,9 @@ fn expand_by_rules(base: Date, rule: &ParsedRRule) -> Vec<Date> {
                         md as u8
                     } else {
                         let d = days_in_month as i8 + 1 + md;
-                        if d < 1 { continue; }
+                        if d < 1 {
+                            continue;
+                        }
                         d as u8
                     };
                     if day >= 1 && day <= days_in_month {
@@ -706,9 +714,13 @@ fn expand_by_rules(base: Date, rule: &ParsedRRule) -> Vec<Date> {
                 if !rule.by_monthday.is_empty() {
                     let dim = days_in_month(year, m);
                     for &md in &rule.by_monthday {
-                        let day = if md > 0 { md as u8 } else {
+                        let day = if md > 0 {
+                            md as u8
+                        } else {
                             let d = dim as i8 + 1 + md;
-                            if d < 1 { continue; }
+                            if d < 1 {
+                                continue;
+                            }
                             d as u8
                         };
                         if day >= 1 && day <= dim {
@@ -750,9 +762,7 @@ fn days_in_month(year: i16, month: u8) -> u8 {
     };
     let this = Date::new(year, m as i8, 1);
     match (this, next) {
-        (Ok(a), Ok(b)) => {
-            b.since(a).map(|s| s.get_days() as u8).unwrap_or(30)
-        }
+        (Ok(a), Ok(b)) => b.since(a).map(|s| s.get_days() as u8).unwrap_or(30),
         _ => 30,
     }
 }

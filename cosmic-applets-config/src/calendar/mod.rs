@@ -97,7 +97,9 @@ pub enum SourceType {
         #[serde(default)]
         auth: AuthMethod,
     },
-    IcsFile { path: String },
+    IcsFile {
+        path: String,
+    },
 }
 
 /// A single calendar collection discovered on a CalDAV server.
@@ -108,7 +110,10 @@ pub struct CalDavCalendar {
     /// Human-readable name from the server (`displayname` property).
     pub display_name: String,
     /// Server-provided color (e.g. from `calendar-color` property).
-    #[serde(default = "default_calendar_color", deserialize_with = "deserialize_color_compat")]
+    #[serde(
+        default = "default_calendar_color",
+        deserialize_with = "deserialize_color_compat"
+    )]
     pub color: String,
     /// Whether the user has opted to sync this calendar.
     pub enabled: bool,
@@ -130,7 +135,9 @@ pub struct CalDavCalendar {
 pub enum AuthMethod {
     None,
     /// Basic auth – username stored here, password in Secret Service keyring.
-    Basic { username: String },
+    Basic {
+        username: String,
+    },
     /// Bearer token – token stored in Secret Service keyring.
     Bearer,
     /// OIDC – issuer/client metadata here, tokens in Secret Service keyring.

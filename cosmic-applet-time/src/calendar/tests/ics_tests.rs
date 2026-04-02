@@ -1,7 +1,13 @@
-use crate::calendar::event::{parse_ics_events, parse_ics_todos, CalendarEvent, CalendarTodo};
-use jiff::{civil::Date, tz::TimeZone, Zoned};
+use crate::calendar::event::{CalendarEvent, CalendarTodo, parse_ics_events, parse_ics_todos};
+use jiff::{Zoned, civil::Date, tz::TimeZone};
 
-fn make_event(uid: &str, summary: &str, start: Zoned, end: Option<Zoned>, all_day: bool) -> CalendarEvent {
+fn make_event(
+    uid: &str,
+    summary: &str,
+    start: Zoned,
+    end: Option<Zoned>,
+    all_day: bool,
+) -> CalendarEvent {
     CalendarEvent {
         uid: uid.to_string(),
         source_id: "test".to_string(),
@@ -34,7 +40,13 @@ fn utc(y: i16, m: i8, d: i8, h: i8, min: i8) -> Zoned {
 fn event_round_trip() {
     let start = utc(2026, 3, 15, 10, 0);
     let end = utc(2026, 3, 15, 11, 30);
-    let ev = make_event("round-trip-1", "Team Meeting", start.clone(), Some(end.clone()), false);
+    let ev = make_event(
+        "round-trip-1",
+        "Team Meeting",
+        start.clone(),
+        Some(end.clone()),
+        false,
+    );
     let ics = ev.to_ics();
     let parsed = parse_ics_events(&ics, "test", "#FF0000");
     assert_eq!(parsed.len(), 1);
@@ -53,8 +65,16 @@ fn event_round_trip() {
 // all-day event round-trip
 #[test]
 fn all_day_event_round_trip() {
-    let start = Date::new(2026, 6, 1).unwrap().at(0, 0, 0, 0).to_zoned(TimeZone::UTC).unwrap();
-    let end = Date::new(2026, 6, 2).unwrap().at(0, 0, 0, 0).to_zoned(TimeZone::UTC).unwrap();
+    let start = Date::new(2026, 6, 1)
+        .unwrap()
+        .at(0, 0, 0, 0)
+        .to_zoned(TimeZone::UTC)
+        .unwrap();
+    let end = Date::new(2026, 6, 2)
+        .unwrap()
+        .at(0, 0, 0, 0)
+        .to_zoned(TimeZone::UTC)
+        .unwrap();
     let ev = make_event("allday-1", "Holiday", start.clone(), Some(end), true);
     let ics = ev.to_ics();
     let parsed = parse_ics_events(&ics, "test", "#00FF00");
@@ -101,7 +121,10 @@ fn todo_round_trip() {
     assert_eq!(p.summary, "Buy groceries");
     assert!(!p.completed);
     assert!(p.due.is_some());
-    assert_eq!(p.due.as_ref().unwrap().date(), Date::new(2026, 4, 15).unwrap());
+    assert_eq!(
+        p.due.as_ref().unwrap().date(),
+        Date::new(2026, 4, 15).unwrap()
+    );
 }
 
 // parse real-world ICS samples from fixture files
@@ -110,7 +133,10 @@ fn parse_vevent_with_rrule_and_exdate() {
     let ics = include_str!("fixtures/nextcloud_rrule_exdate.ics");
     let events = parse_ics_events(ics, "nc", "#3366CC");
     assert_eq!(events.len(), 1);
-    assert_eq!(events[0].rrule.as_deref(), Some("FREQ=WEEKLY;BYDAY=MO;COUNT=8"));
+    assert_eq!(
+        events[0].rrule.as_deref(),
+        Some("FREQ=WEEKLY;BYDAY=MO;COUNT=8")
+    );
     assert_eq!(events[0].exdates.len(), 1);
     assert_eq!(events[0].exdates[0], Date::new(2026, 1, 19).unwrap());
 }

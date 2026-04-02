@@ -7,7 +7,7 @@
 //! completes.
 
 use crate::calendar::event::{CalendarEvent, CalendarTodo};
-use jiff::{civil::Date, tz::TimeZone, Timestamp, Zoned};
+use jiff::{Timestamp, Zoned, civil::Date, tz::TimeZone};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -171,7 +171,11 @@ fn cached_to_todo(c: CachedTodo) -> CalendarTodo {
     }
 }
 
-pub(crate) fn save_cache_to_path(path: &Path, events: &[CalendarEvent], todos: &[CalendarTodo]) -> Result<(), String> {
+pub(crate) fn save_cache_to_path(
+    path: &Path,
+    events: &[CalendarEvent],
+    todos: &[CalendarTodo],
+) -> Result<(), String> {
     let cache = EventCache {
         timestamp: Zoned::now().timestamp().to_string(),
         events: events.iter().map(event_to_cached).collect(),
@@ -188,7 +192,11 @@ pub(crate) fn save_cache_to_path(path: &Path, events: &[CalendarEvent], todos: &
 pub(crate) fn load_cache_from_path(path: &Path) -> Option<(Vec<CalendarEvent>, Vec<CalendarTodo>)> {
     let data = std::fs::read_to_string(path).ok()?;
     let cache: EventCache = serde_json::from_str(&data).ok()?;
-    let events: Vec<CalendarEvent> = cache.events.into_iter().filter_map(cached_to_event).collect();
+    let events: Vec<CalendarEvent> = cache
+        .events
+        .into_iter()
+        .filter_map(cached_to_event)
+        .collect();
     let todos: Vec<CalendarTodo> = cache.todos.into_iter().map(cached_to_todo).collect();
     Some((events, todos))
 }
@@ -213,11 +221,7 @@ pub fn load_cache() -> Option<(Vec<CalendarEvent>, Vec<CalendarTodo>)> {
 use crate::calendar::crypto::EncryptionKey;
 
 /// Save events+todos as encrypted bytes.
-pub fn save_cache_encrypted(
-    events: &[CalendarEvent],
-    todos: &[CalendarTodo],
-    key: &EncryptionKey,
-) {
+pub fn save_cache_encrypted(events: &[CalendarEvent], todos: &[CalendarTodo], key: &EncryptionKey) {
     let Some(path) = cache_path() else { return };
     let cache = EventCache {
         timestamp: jiff::Zoned::now().timestamp().to_string(),
@@ -258,7 +262,11 @@ pub fn load_cache_encrypted(
         }
     };
     let cache: EventCache = serde_json::from_slice(&plaintext).ok()?;
-    let events = cache.events.into_iter().filter_map(cached_to_event).collect();
+    let events = cache
+        .events
+        .into_iter()
+        .filter_map(cached_to_event)
+        .collect();
     let todos = cache.todos.into_iter().map(cached_to_todo).collect();
     Some((events, todos))
 }
@@ -303,7 +311,9 @@ pub fn save_ctag_cache_encrypted(
     cache: &HashMap<(String, String), (Option<String>, Option<String>)>,
     key: &EncryptionKey,
 ) {
-    let Some(path) = ctag_cache_path() else { return };
+    let Some(path) = ctag_cache_path() else {
+        return;
+    };
     let entries: HashMap<String, (Option<String>, Option<String>)> = cache
         .iter()
         .map(|((sid, href), v)| (format!("{sid}::{href}"), v.clone()))
@@ -396,7 +406,9 @@ pub fn salt_path() -> Option<PathBuf> {
 }
 
 pub fn save_ctag_cache(cache: &HashMap<(String, String), (Option<String>, Option<String>)>) {
-    let Some(path) = ctag_cache_path() else { return };
+    let Some(path) = ctag_cache_path() else {
+        return;
+    };
     let entries: HashMap<String, (Option<String>, Option<String>)> = cache
         .iter()
         .map(|((sid, href), v)| (format!("{sid}::{href}"), v.clone()))

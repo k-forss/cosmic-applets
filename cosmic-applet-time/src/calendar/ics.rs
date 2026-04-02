@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use crate::calendar::config::AuthMethod;
-use crate::calendar::event::{parse_ics_events, CalendarEvent};
+use crate::calendar::event::{CalendarEvent, parse_ics_events};
 use crate::calendar::secrets::{self, SecretKind};
 
 /// Fetch and parse an ICS feed from a URL, optionally with authentication.
@@ -18,8 +18,7 @@ pub async fn fetch_ics_url(
         .connect_timeout(std::time::Duration::from_secs(10));
 
     if let Some(path) = ca_cert_path {
-        let pem = std::fs::read(path)
-            .map_err(|e| format!("Failed to read CA cert {path}: {e}"))?;
+        let pem = std::fs::read(path).map_err(|e| format!("Failed to read CA cert {path}: {e}"))?;
         let cert = reqwest::tls::Certificate::from_pem(&pem)
             .map_err(|e| format!("Invalid CA cert PEM: {e}"))?;
         builder = builder.add_root_certificate(cert);
@@ -61,7 +60,7 @@ async fn apply_ics_auth(
             let password = secrets::load_secret(source_id, SecretKind::Password)
                 .await
                 .map_err(|e| format!("Failed to load password from keyring: {e}"))?
-                .unwrap_or_default();
+                .ok_or_else(|| "Password not found in keyring".to_string())?;
             request.basic_auth(username, Some(password.as_str()))
         }
         AuthMethod::Bearer => {
@@ -71,14 +70,18 @@ async fn apply_ics_auth(
                 .ok_or_else(|| "Bearer token not found in keyring".to_string())?;
             request.bearer_auth(token.as_str())
         }
-        AuthMethod::Oidc { has_token: true, .. } => {
+        AuthMethod::Oidc {
+            has_token: true, ..
+        } => {
             let token = secrets::load_secret(source_id, SecretKind::OidcAccessToken)
                 .await
                 .map_err(|e| format!("Failed to load OIDC token: {e}"))?
                 .ok_or_else(|| "OIDC token not found".to_string())?;
             request.bearer_auth(token.as_str())
         }
-        AuthMethod::Oidc { has_token: false, .. } => {
+        AuthMethod::Oidc {
+            has_token: false, ..
+        } => {
             return Err("OIDC authentication required".to_string());
         }
     })

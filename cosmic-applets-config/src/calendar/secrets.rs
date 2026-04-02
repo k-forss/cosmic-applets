@@ -10,7 +10,7 @@ use secret_service::{EncryptionType, SecretService};
 use std::collections::HashMap;
 use zeroize::Zeroizing;
 
-const APP_LABEL: &str = "com.system76.CosmicAppletTime";
+const APP_LABEL: &str = super::CALENDAR_CONFIG_ID;
 
 /// The kinds of secrets we store per calendar source.
 #[derive(Debug, Clone, Copy)]
@@ -45,11 +45,7 @@ fn attributes(source_id: &str, kind: SecretKind) -> HashMap<&str, &str> {
 }
 
 /// Store a secret in the default keyring collection.
-pub async fn store_secret(
-    source_id: &str,
-    kind: SecretKind,
-    secret: &str,
-) -> Result<(), String> {
+pub async fn store_secret(source_id: &str, kind: SecretKind, secret: &str) -> Result<(), String> {
     let ss = SecretService::connect(EncryptionType::Dh)
         .await
         .map_err(|e| format!("Failed to connect to Secret Service: {e}"))?;
@@ -81,7 +77,10 @@ pub async fn store_secret(
 /// Load a secret from the default keyring collection.
 ///
 /// Returns `None` if no matching secret is found.
-pub async fn load_secret(source_id: &str, kind: SecretKind) -> Result<Option<Zeroizing<String>>, String> {
+pub async fn load_secret(
+    source_id: &str,
+    kind: SecretKind,
+) -> Result<Option<Zeroizing<String>>, String> {
     let ss = SecretService::connect(EncryptionType::Dh)
         .await
         .map_err(|e| format!("Failed to connect to Secret Service: {e}"))?;

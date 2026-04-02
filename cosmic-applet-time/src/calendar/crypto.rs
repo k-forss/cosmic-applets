@@ -37,7 +37,9 @@ impl std::fmt::Display for CryptoError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::DataTooShort => f.write_str("encrypted data too short"),
-            Self::DecryptionFailed => f.write_str("decryption failed (wrong key or corrupted data)"),
+            Self::DecryptionFailed => {
+                f.write_str("decryption failed (wrong key or corrupted data)")
+            }
         }
     }
 }

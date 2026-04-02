@@ -59,11 +59,15 @@ fn cache_filesystem_round_trip() {
     assert!(path.exists());
 
     // Load from disk
-    let (loaded_events, loaded_todos) = crate::calendar::cache::load_cache_from_path(&path).unwrap();
+    let (loaded_events, loaded_todos) =
+        crate::calendar::cache::load_cache_from_path(&path).unwrap();
     assert_eq!(loaded_events.len(), 1);
     assert_eq!(loaded_events[0].uid, "cache-evt-1");
     assert_eq!(loaded_events[0].summary, "Cached Event");
-    assert_eq!(loaded_events[0].description.as_deref(), Some("A description"));
+    assert_eq!(
+        loaded_events[0].description.as_deref(),
+        Some("A description")
+    );
     assert_eq!(loaded_events[0].location.as_deref(), Some("Office"));
     assert_eq!(loaded_events[0].all_day, false);
 
@@ -133,10 +137,7 @@ fn ctag_cache_serde() {
         ("src1".into(), "/cal/1".into()),
         (Some("ctag-v1".into()), Some("sync-tok-1".into())),
     );
-    cache.insert(
-        ("src2".into(), "/cal/2".into()),
-        (None, None),
-    );
+    cache.insert(("src2".into(), "/cal/2".into()), (None, None));
 
     // The ctag cache uses a Vec of tuples for serialization
     #[derive(serde::Serialize, serde::Deserialize)]

@@ -84,6 +84,12 @@ fn ctag_sync_token_skip_serializing() {
         sync_token: Some("token-456".into()),
     };
     let json = serde_json::to_string(&cal).unwrap();
-    assert!(!json.contains("ctag"), "ctag should not be serialized: {json}");
-    assert!(!json.contains("sync_token"), "sync_token should not be serialized: {json}");
+    assert!(
+        !json.contains("ctag"),
+        "ctag should not be serialized: {json}"
+    );
+    assert!(
+        !json.contains("sync_token"),
+        "sync_token should not be serialized: {json}"
+    );
 }

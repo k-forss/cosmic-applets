@@ -10,10 +10,10 @@
 //! 5. Exchange the code for access and refresh tokens
 
 use openidconnect::{
-    core::{CoreClient, CoreProviderMetadata},
-    reqwest::async_http_client,
     AuthorizationCode, ClientId, ClientSecret, CsrfToken, IssuerUrl, Nonce, OAuth2TokenResponse,
     PkceCodeChallenge, RedirectUrl, RefreshToken, Scope, TokenResponse,
+    core::{CoreClient, CoreProviderMetadata},
+    reqwest::async_http_client,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -53,7 +53,8 @@ pub async fn oidc_login(
     let provider = tokio::time::timeout(
         std::time::Duration::from_secs(30),
         CoreProviderMetadata::discover_async(
-            IssuerUrl::new(issuer_url.to_string()).map_err(|e| format!("Invalid issuer URL: {e}"))?,
+            IssuerUrl::new(issuer_url.to_string())
+                .map_err(|e| format!("Invalid issuer URL: {e}"))?,
             async_http_client,
         ),
     )
@@ -162,7 +163,8 @@ pub async fn oidc_refresh(
     let provider = tokio::time::timeout(
         std::time::Duration::from_secs(30),
         CoreProviderMetadata::discover_async(
-            IssuerUrl::new(issuer_url.to_string()).map_err(|e| format!("Invalid issuer URL: {e}"))?,
+            IssuerUrl::new(issuer_url.to_string())
+                .map_err(|e| format!("Invalid issuer URL: {e}"))?,
             async_http_client,
         ),
     )
@@ -288,11 +290,7 @@ async fn wait_for_callback(
     Err("Too many invalid callback requests".to_string())
 }
 
-async fn send_response(
-    stream: &mut tokio::net::TcpStream,
-    status: &str,
-    body: &str,
-) {
+async fn send_response(stream: &mut tokio::net::TcpStream, status: &str, body: &str) {
     let response = format!(
         "HTTP/1.1 {status}\r\n\
          Content-Type: text/html; charset=utf-8\r\n\
